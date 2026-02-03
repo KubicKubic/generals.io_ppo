@@ -276,42 +276,51 @@ class GeneralsEnv:
     # -----------------------------
     # Map generation
     # -----------------------------
+    
     def _generate_map(self):
         """
-        Requirements implemented:
-          - self.H/self.W fixed (default 25x25)
-          - real_H, real_W sampled uniformly from [15, 25]
+        Map generation (real area only, excluding the padded mountains outside real_H/real_W):
+
+          - real_H, real_W sampled uniformly from [min_real_size, max_real_size]
           - outside real area filled with mountains
-          - generals Manhattan distance >= 15 (hard)
-          - each city initial army uniform in [40, 50]
-          - generals must be connected via passable land (non-mountain tiles)
+          - place 2 generals on EMPTY tiles with Manhattan distance >= min_general_dist
+          - sample:
+                * mountain ratio in [1/8, 1/4]  => a = floor(ratio * area)
+                * city count in [4, 10]         => b
+          - then:
+                * repeat a times: pick a LEGAL EMPTY tile and turn it into a mountain
+                * repeat b times: pick a LEGAL EMPTY tile and turn it into a neutral city
+            LEGAL means: the two generals are still connected via EMPTY land
+            (i.e., a path using only EMPTY/GENERAL tiles; cities are treated as non-empty for this check).
+
+          - each city initial army uniform in [city_initial_low, city_initial_high]
         """
         # Sample real dimensions uniformly
         self.real_H = int(self.rng.integers(self.min_real_size, self.max_real_size + 1))
         self.real_W = int(self.rng.integers(self.min_real_size, self.max_real_size + 1))
 
+        area = self.real_H * self.real_W
+
         # We will retry whole map generation until constraints are satisfied.
         for _attempt in range(500):
             self._init_base_with_padding()
-
-            # Place random internal mountains in the real area
-            self._place_internal_mountains()
 
             # Place generals with hard distance constraint
             ok_generals = self._place_generals_with_constraints()
             if not ok_generals:
                 continue
 
-            # Connectivity constraint (passable = non-mountain)
-            if not self._generals_connected():
+            # Sample counts (inside real area only)
+            ratio = float(self.rng.uniform(1.0 / 8.0, 1.0 / 4.0))
+            a = int(np.floor(ratio * area))  # number of internal mountains
+            b = int(self.rng.integers(4, 11))  # number of cities
+
+            # Place a mountains then b cities, each step must keep generals connected via EMPTY land
+            if not self._place_mountains_and_cities_conditional(a=a, b=b):
                 continue
 
-            # Place cities (neutral) with random size 40..50
-            self._place_neutral_cities()
-
-            # Ensure generals still exist and remain on passable tiles
-            # (cities don't affect passability; still safe to assert)
-            if not self._generals_connected():
+            # Final sanity: generals connected via EMPTY land (stronger than non-mountain connectivity)
+            if not self._generals_connected_via_empty():
                 continue
 
             return
@@ -347,6 +356,128 @@ class GeneralsEnv:
             c = int(self.rng.integers(0, self.real_W))
             self.tile_type[r, c] = TileType.MOUNTAIN
             # owner/army stay neutral/0
+
+    
+    def _generals_connected_via_empty(self) -> bool:
+        """
+        Check if the two generals are connected via EMPTY land (plus endpoints on GENERAL),
+        within the real area. That is, we allow traversal on tiles whose tile_type is
+        EMPTY or GENERAL only.
+        """
+        g0 = self.general_pos[Owner.P0]
+        g1 = self.general_pos[Owner.P1]
+        if g0 is None or g1 is None:
+            return False
+
+        (sr, sc) = g0
+        (tr, tc) = g1
+
+        sub = self.tile_type[: self.real_H, : self.real_W]
+        passable = (sub == TileType.EMPTY) | (sub == TileType.GENERAL)
+
+        if not passable[sr, sc] or not passable[tr, tc]:
+            return False
+
+        q_r = np.empty(self.real_H * self.real_W, dtype=np.int32)
+        q_c = np.empty(self.real_H * self.real_W, dtype=np.int32)
+        head = 0
+        tail = 0
+
+        visited = np.zeros((self.real_H, self.real_W), dtype=np.bool_)
+        visited[sr, sc] = True
+        q_r[tail] = sr
+        q_c[tail] = sc
+        tail += 1
+
+        while head < tail:
+            r = int(q_r[head])
+            c = int(q_c[head])
+            head += 1
+
+            if (r, c) == (tr, tc):
+                return True
+
+            # 4-neighbors
+            if r > 0 and (not visited[r - 1, c]) and passable[r - 1, c]:
+                visited[r - 1, c] = True
+                q_r[tail] = r - 1
+                q_c[tail] = c
+                tail += 1
+            if r + 1 < self.real_H and (not visited[r + 1, c]) and passable[r + 1, c]:
+                visited[r + 1, c] = True
+                q_r[tail] = r + 1
+                q_c[tail] = c
+                tail += 1
+            if c > 0 and (not visited[r, c - 1]) and passable[r, c - 1]:
+                visited[r, c - 1] = True
+                q_r[tail] = r
+                q_c[tail] = c - 1
+                tail += 1
+            if c + 1 < self.real_W and (not visited[r, c + 1]) and passable[r, c + 1]:
+                visited[r, c + 1] = True
+                q_r[tail] = r
+                q_c[tail] = c + 1
+                tail += 1
+
+        return False
+
+    def _place_mountains_and_cities_conditional(self, a: int, b: int) -> bool:
+        """
+        Place exactly a internal mountains, then exactly b cities, each time picking a random
+        EMPTY tile whose conversion keeps the generals connected via EMPTY land.
+        """
+        a = int(a)
+        b = int(b)
+
+        # Mountains first
+        for _ in range(a):
+            if not self._place_one_conditional(TileType.MOUNTAIN):
+                return False
+
+        # Cities then
+        for _ in range(b):
+            if not self._place_one_conditional(TileType.CITY):
+                return False
+
+        return True
+
+    def _place_one_conditional(self, new_type: TileType) -> bool:
+        """
+        Attempt to place one tile of type new_type (MOUNTAIN or CITY) by random sampling
+        over EMPTY tiles in the real area, keeping generals connected via EMPTY land.
+        """
+        # How many random trials for this single placement before giving up.
+        # Real area is at most 25*25=625, so this is cheap.
+        for _trial in range(20000):
+            r = int(self.rng.integers(0, self.real_H))
+            c = int(self.rng.integers(0, self.real_W))
+            if self.tile_type[r, c] != TileType.EMPTY:
+                continue
+
+            # Tentatively place
+            old_type = TileType(int(self.tile_type[r, c]))
+            old_owner = Owner(int(self.owner[r, c]))
+            old_army = int(self.army[r, c])
+
+            self.tile_type[r, c] = new_type
+            self.owner[r, c] = Owner.NEUTRAL
+            self.army[r, c] = 0
+
+            ok = self._generals_connected_via_empty()
+
+            if ok:
+                if new_type == TileType.CITY:
+                    self.owner[r, c] = Owner.NEUTRAL
+                    self.army[r, c] = int(self.rng.integers(self.city_initial_low, self.city_initial_high + 1))
+                # For mountains: already neutral/0
+                return True
+
+            # Revert
+            self.tile_type[r, c] = old_type
+            self.owner[r, c] = old_owner
+            self.army[r, c] = old_army
+
+        return False
 
     def _random_empty_in_real(self) -> Tuple[int, int]:
         """
