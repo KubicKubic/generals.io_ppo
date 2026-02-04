@@ -60,6 +60,7 @@ class VizConfig:
     draw_text: bool = True
     pov_player: int = 0
     reset_episode_before_viz: bool = False
+    topk_actions: int = 10
 
 
 @dataclass
