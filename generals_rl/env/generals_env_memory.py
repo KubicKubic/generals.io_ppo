@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from typing import Dict, Tuple, Optional
 import numpy as np
 
-from generals_env import GeneralsEnv, Owner, TileType, StepResult
+from .generals_env import GeneralsEnv, Owner, TileType, StepResult
 
 
 class GeneralsEnvWithMemory:
@@ -217,35 +217,32 @@ class GeneralsEnvWithMemory:
         opp = Owner.P1 if p == Owner.P0 else Owner.P0
         self_id = p
 
-        lt_m = lt[m]
-        lo_m = lo[m]
+        lt_m = lt[m]  # (N,)
+        lo_m = lo[m]  # (N,)
         out = np.zeros(lt_m.shape[0], dtype=np.int8)
 
-        # 1 mountain
-        is_mountain = (lt_m == TileType.MOUNTAIN)
-        out[is_mountain] = 1
+        # 1) mountain
+        mountain_mask = (lt_m == TileType.MOUNTAIN)
+        out[mountain_mask] = 1
 
-        # city
-        is_city = (lt_m == TileType.CITY)
-        if np.any(is_city):
-            city_owner = lo_m[is_city]
-            out[is_city] = 2  # default: non-opponent city (neutral or mine)
-            out[is_city & (city_owner == int(opp))] = 5
-            out[is_city & (city_owner == int(self_id))] = 7
+        # 2/5/7) city
+        city_mask = (lt_m == TileType.CITY)
+        # default: non-opponent city (neutral or mine)
+        out[city_mask] = 2
+        # opponent city
+        out[city_mask & (lo_m == int(opp))] = 5
+        # my city (lost)
+        out[city_mask & (lo_m == int(self_id))] = 7
 
-        # general
-        is_general = (lt_m == TileType.GENERAL)
-        if np.any(is_general):
-            gen_owner = lo_m[is_general]
-            out[is_general & (gen_owner == int(opp))] = 3
+        # 3) opponent general
+        gen_mask = (lt_m == TileType.GENERAL)
+        out[gen_mask & (lo_m == int(opp))] = 3
 
-        # empty
-        is_empty = (lt_m == TileType.EMPTY)
-        if np.any(is_empty):
-            empty_owner = lo_m[is_empty]
-            out[is_empty & (empty_owner == int(opp))] = 4
-            out[is_empty & (empty_owner == int(self_id))] = 6
-            # neutral empty => 0
+        # 4/6) empty tiles (land)
+        empty_mask = (lt_m == TileType.EMPTY)
+        out[empty_mask & (lo_m == int(opp))] = 4
+        out[empty_mask & (lo_m == int(self_id))] = 6
+        # neutral empty remains 0
 
         tag[m] = out
         return tag

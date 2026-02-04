@@ -21,7 +21,7 @@ import numpy as np
 
 import pygame
 
-from generals_env import GeneralsEnv, Owner, TileType, MoveMode, Dir, encode_action
+from generals_rl.env.generals_env import GeneralsEnv, Owner, TileType, MoveMode, Dir, encode_action
 
 
 # ---------- UI config ----------
