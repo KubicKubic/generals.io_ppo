@@ -71,7 +71,7 @@ def viz_begin_update(
         raise RuntimeError("Visualization requires imageio. pip install imageio imageio-ffmpeg")
 
     os.makedirs(out_dir, exist_ok=True)
-    stride = max(1, int(rollout_len) // max(1, int(frames_per_update)))
+    stride = 1
 
     writer = None
     if save_mp4:

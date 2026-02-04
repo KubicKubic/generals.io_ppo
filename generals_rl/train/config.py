@@ -69,6 +69,8 @@ class EnvConfig:
     max_halfturns: Optional[int] = None
     reset_seed_mode: str = "increment"   # "fixed" | "increment" | "random"
     seed_increment: int = 1
+    # If True, disallow actions with mode m=1 (i.e., keep only m=0).
+    forbid_mode1: bool = False
 
 
 @dataclass
@@ -85,6 +87,17 @@ class ModelConfig:
     name: str = "rope_factorized"
     rope: Dict[str, Any] = field(default_factory=dict)
     spatial: Dict[str, Any] = field(default_factory=lambda: {"d": 128, "meta_proj": 16})
+    # New spatiotemporal RoPE-Transformer policy (keeps spatial structure; RoPE Transformer over time per-cell).
+    st_rope2d: Dict[str, Any] = field(
+        default_factory=lambda: {
+            "enc_hidden": 64,     # conv hidden for per-frame encoder
+            "d_model": 64,   # transformer d_model over time (must be divisible by nhead and head_dim even)
+            "nhead": 4,
+            "nlayers": 2,
+            "dropout": 0.0,
+            "head_hidden": 64,    # conv hidden for action head
+        }
+    )
 
 
 # -----------------------------
@@ -107,6 +120,7 @@ class TrainConfig:
     resume_path: Optional[str] = None
     save_policy_path: str = "generals_seq_policy.pt"
     save_resolved_config: bool = True
+    seq_padding: bool = False
 
     # nested
     env: EnvConfig = field(default_factory=EnvConfig)
@@ -196,16 +210,26 @@ def load_config(path: str) -> TrainConfig:
         resume_path=merged.get("resume_path", None),
         save_policy_path=str(merged.get("save_policy_path", "generals_seq_policy.pt")),
         save_resolved_config=bool(merged.get("save_resolved_config", True)),
+        seq_padding=bool(merged.get("seq_padding", False)),
         env=EnvConfig(
             base_seed=int(env_d.get("base_seed", 0)),
             max_halfturns=env_d.get("max_halfturns", None),
             reset_seed_mode=str(env_d.get("reset_seed_mode", "increment")),
             seed_increment=int(env_d.get("seed_increment", 1)),
+            forbid_mode1=bool(env_d.get("forbid_mode1", False)),
         ),
         model=ModelConfig(
             name=str(model_d.get("name", "rope_factorized")),
             rope=dict(model_d.get("rope", {}) or {}),
             spatial=dict(model_d.get("spatial", {}) or {"d": 128, "meta_proj": 16}),
+            st_rope2d=dict(model_d.get("st_rope2d", {}) or {
+                "enc_hidden": 64,
+                "d_model": 64,
+                "nhead": 4,
+                "nlayers": 2,
+                "dropout": 0.0,
+                "head_hidden": 64,
+            }),
         ),
         ppo=PPOConfig(**(merged.get("ppo", {}) or {})),
         opponent=OpponentConfig(**(merged.get("opponent", {}) or {})),

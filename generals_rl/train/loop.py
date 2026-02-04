@@ -11,7 +11,7 @@ import torch.optim as optim
 from ..env.generals_env import Owner, TileType
 from ..data.history import ObsHistory
 from ..data.encoding import encode_obs_sequence
-from ..models import make_policy
+from ..models.registry import make_policy
 
 from .config import TrainConfig
 from .rng import set_seed, get_rng_state, set_rng_state
@@ -50,6 +50,7 @@ def train(cfg: TrainConfig, device=None):
         meta_dim=10,
         rope=cfg.model.rope,
         spatial=cfg.model.spatial,
+        st_rope2d=cfg.model.st_rope2d,
     ).to(device)
     optimizer = optim.Adam(policy.parameters(), lr=float(cfg.lr))
 
@@ -167,7 +168,7 @@ def train(cfg: TrainConfig, device=None):
         for step in range(int(cfg.rollout_len)):
             phi_s = phi_from_scores(obs0, cfg.reward_shaping.w_army, cfg.reward_shaping.w_land)
 
-            seq0 = h0.get_padded_seq()
+            seq0 = h0.get_padded_seq() if cfg.seq_padding else h0.get_seq()
             x_img0_seq, x_meta0_seq = encode_obs_sequence(seq0, player_id=0)
             x_img0 = x_img0_seq.unsqueeze(0).to(device)
             x_meta0 = x_meta0_seq.unsqueeze(0).to(device)
@@ -256,7 +257,7 @@ def train(cfg: TrainConfig, device=None):
         if last_done:
             last_v = 0.0
         else:
-            seq0 = h0.get_padded_seq()
+            seq0 = h0.get_padded_seq() if cfg.seq_padding else h0.get_seq()
             x_img0_seq, x_meta0_seq = encode_obs_sequence(seq0, player_id=0)
             x_img0 = x_img0_seq.unsqueeze(0).to(device)
             x_meta0 = x_meta0_seq.unsqueeze(0).to(device)

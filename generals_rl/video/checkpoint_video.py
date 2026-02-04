@@ -20,8 +20,6 @@ except Exception:
 from ..env.generals_env import Owner, TileType
 from ..env.generals_env_memory import GeneralsEnvWithMemory
 from ..data import ObsHistory, encode_obs_sequence
-from ..models import SeqPPOPolicyRoPEFactorized
-
 
 # ---------- rendering helpers ----------
 def _clamp(x, lo, hi):
@@ -276,10 +274,11 @@ def run_one_game_and_record(
     cell: int = 20,
     draw_text: bool = True,
     random_opp_prob: float = 1.0,  # compat; unused
-    pov_player: int = 0,            # which player is "self"(blue) in rendering
+    pov_player: int = 0,
 ):
     """
     Load checkpoint -> run 1 episode (P0 uses checkpoint policy) vs random bot -> save mp4.
+    Deterministic (argmax) actions for P0.
     """
     if imageio is None:
         raise RuntimeError("imageio not installed. Please: pip install imageio imageio-ffmpeg")
@@ -302,7 +301,6 @@ def run_one_game_and_record(
     h1 = ObsHistory(max_len=T); h1.reset(obs1)
 
     writer = imageio.get_writer(out_mp4, fps=fps, codec="libx264", quality=8)
-
     frames_per_halfturn = 1
 
     def append_frame_repeated():
@@ -310,11 +308,63 @@ def run_one_game_and_record(
         for _ in range(frames_per_halfturn):
             writer.append_data(frame)
 
+    def _argmax_masked(logits: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        """
+        logits: (B,K), mask: (B,K) bool
+        returns argmax index (B,)
+        """
+        masked_logits = logits.masked_fill(~mask, -1e9)
+        return masked_logits.argmax(dim=-1)
+
+    def choose_p0_action_argmax(x_img0: torch.Tensor, x_meta0: torch.Tensor, mask0: torch.Tensor) -> int:
+        """
+        Deterministic version of policy.act(): pick argmax src, argmax dir, argmax mode under masks.
+        """
+        # global features + value (value not needed here)
+        g, _v = policy.global_features(x_img0, x_meta0)
+        logits_src = policy.pi_src(g)  # (1, src_size)
+
+        src_mask, dm_mask = policy.split_masks(mask0)  # (1,src), (1,src,8)
+
+        # if no legal src (shouldn't), fallback random legal action
+        if not bool(src_mask.any().item()):
+            legal = torch.nonzero(mask0[0]).view(-1)
+            if legal.numel() == 0:
+                return 0
+            return int(legal[0].item())
+
+        # pick best src
+        src = _argmax_masked(logits_src, src_mask)  # (1,)
+        src_i = int(src.item())
+
+        # conditioned logits for this src
+        logits_dir, logits_mode = policy.dir_mode_logits(g, src)  # (1,4),(1,2)
+
+        # conditioned masks for this src
+        row = dm_mask[0, src_i]          # (8,)
+        dm = row.view(4, 2)              # (4,2)
+        dir_mask = dm.any(dim=-1).unsqueeze(0)   # (1,4)
+        mode_mask = dm.any(dim=-2).unsqueeze(0)  # (1,2)
+
+        # if something degenerate happens, fallback to best legal flat action
+        if (not bool(dir_mask.any().item())) or (not bool(mode_mask.any().item())):
+            legal = torch.nonzero(mask0[0]).view(-1)
+            if legal.numel() == 0:
+                return 0
+            # pick the first legal (or could pick argmax of flat logits if you implement)
+            return int(legal[0].item())
+
+        d = _argmax_masked(logits_dir, dir_mask)     # (1,)
+        m = _argmax_masked(logits_mode, mode_mask)   # (1,)
+
+        action_flat = ((src * 4 + d) * 2 + m).long()
+        return int(action_flat.item())
+
     try:
         append_frame_repeated()
 
         while True:
-            # P0 action (checkpoint)
+            # P0 action (deterministic argmax)
             seq0 = h0.get_padded_seq()
             x_img0_seq, x_meta0_seq = encode_obs_sequence(seq0, player_id=0)
             x_img0 = x_img0_seq.unsqueeze(0).to(device)
@@ -323,14 +373,14 @@ def run_one_game_and_record(
             mask0_np = env.legal_action_mask(Owner.P0)
             mask0 = torch.from_numpy(mask0_np).unsqueeze(0).to(device).to(torch.bool)
 
-            a0, _, _, _ = policy.act(x_img0, x_meta0, mask0)
+            a0 = choose_p0_action_argmax(x_img0, x_meta0, mask0)
 
             # P1 action: random legal
             mask1_np = env.legal_action_mask(Owner.P1)
             legal1 = np.flatnonzero(mask1_np)
             a1 = int(np.random.choice(legal1)) if len(legal1) > 0 else 0
 
-            res = env.step(int(a0.item()), int(a1))
+            res = env.step(int(a0), int(a1))
             obs0, obs1 = res.obs
             h0.push(obs0); h1.push(obs1)
 
@@ -340,7 +390,6 @@ def run_one_game_and_record(
                 break
     finally:
         writer.close()
-
 
 def make_video_for_checkpoint(
     ckpt_path: str,
@@ -370,3 +419,9 @@ def make_video_for_checkpoint(
         pov_player=pov_player,
     )
     return out_mp4
+
+if __name__ == "__main__":
+    make_video_for_checkpoint(
+        ckpt_path="/qiyuan_research_vepfs_001/guoyuchong/my/generals.io_ppo/checkpoints/ckpt_000056.pt",
+        videos_dir="/qiyuan_research_vepfs_001/guoyuchong/my/generals.io_ppo/videos"
+    )

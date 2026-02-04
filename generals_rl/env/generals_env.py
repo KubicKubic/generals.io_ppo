@@ -145,6 +145,9 @@ class GeneralsEnv:
         min_real_size: int = 15,
         max_real_size: int = 25,
         min_general_dist: int = 15,
+
+        # action-space constraint
+        forbid_mode1: bool = False,
     ):
         self.H, self.W = int(H), int(W)
         if self.H != 25 or self.W != 25:
@@ -167,6 +170,9 @@ class GeneralsEnv:
         self.min_real_size = int(min_real_size)
         self.max_real_size = int(max_real_size)
         self.min_general_dist = int(min_general_dist)
+
+        # If True, disallow actions with mode==1 when computing legal action masks.
+        self.forbid_mode1 = bool(forbid_mode1)
 
         # state arrays are fixed size (25x25 by default)
         self.tile_type = np.zeros((self.H, self.W), dtype=np.int8)
@@ -266,6 +272,8 @@ class GeneralsEnv:
                     if self.tile_type[rr, cc] == TileType.MOUNTAIN:
                         continue
                     for mode in range(2):
+                        if self.forbid_mode1 and mode == 1:
+                            continue
                         a = encode_action(r, c, d, mode, self.W)
                         mask[a] = True
 

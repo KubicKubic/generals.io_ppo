@@ -7,10 +7,9 @@ from ..env.generals_env import Owner
 from ..env.generals_env_memory import GeneralsEnvWithMemory
 from ..data.encoding import encode_obs_sequence
 from ..data.history import ObsHistory
-from ..models.policy_rope_factorized import SeqPPOPolicyRoPEFactorized
 
 @torch.no_grad()
-def choose_opponent_action(env: GeneralsEnvWithMemory, opp_policy: Optional[SeqPPOPolicyRoPEFactorized], opp_hist: ObsHistory,
+def choose_opponent_action(env: GeneralsEnvWithMemory, opp_policy, opp_hist: ObsHistory,
                           device, random_prob: float, T: int) -> int:
     mask_np = env.legal_action_mask(Owner.P1)
     legal = np.flatnonzero(mask_np)

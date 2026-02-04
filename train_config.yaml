@@ -1,26 +1,28 @@
 total_updates: 1200
-rollout_len: 2048
+rollout_len: 8192
 T: 1
 lr: 1e-3
 gamma: 0.99
 lam: 0.95
 ckpt_dir: checkpoints
-save_every: 8
+save_every: 16
 log_every: 1
 resume_path: null
 save_policy_path: generals_seq_policy.pt
 save_resolved_config: true
+seq_padding: false
 env:
   base_seed: 0
   max_halfturns: 50
   reset_seed_mode: increment
   seed_increment: 1
+  forbid_mode1: true
 ppo:
   clip_eps: 0.2
   vf_coef: 0.5
   ent_coef: 0.1
   epochs: 1
-  minibatch: 128
+  minibatch: 2048
   max_grad_norm: 1.0
 reward_shaping:
   w_army: 0.1
@@ -31,14 +33,14 @@ opponent:
   pool_empty_mode: random
   fallback_mode: random
   snapshot_every: 25
-  opponent_pool_max: 12
+  opponent_pool_max: 0
 video:
   make_video: false
 viz:
   enable: true
   out_dir: samples_viz
   every_updates: 8
-  frames_per_update: 2048
+  frames_per_update: 512
   save_mp4: true
   mp4_fps: 2
   save_trace_jsonl: true
@@ -48,8 +50,16 @@ viz:
   reset_episode_before_viz: false
   topk_actions: 3
 model:
-  name: spatial_factorized
+  # Choose one of: rope_factorized | spatial_factorized | st_rope2d
+  name: st_rope2d
   rope: {}
   spatial:
     d: 128
     meta_proj: 16
+  st_rope2d:
+    enc_hidden: 64
+    d_model: 64
+    nhead: 4
+    nlayers: 2
+    dropout: 0.0
+    head_hidden: 64

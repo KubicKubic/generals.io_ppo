@@ -17,6 +17,13 @@ class ObsHistory:
         if len(self.buf) > self.max_len:
             self.buf = self.buf[-self.max_len:]
 
+    def get_seq(self) -> List[Dict[str, np.ndarray]]:
+        if not self.buf:
+            raise RuntimeError("ObsHistory empty; call reset() first.")
+        if len(self.buf) >= self.max_len:
+            return self.buf[-self.max_len:]
+        return self.buf
+
     def get_padded_seq(self) -> List[Dict[str, np.ndarray]]:
         if not self.buf:
             raise RuntimeError("ObsHistory empty; call reset() first.")

@@ -24,6 +24,8 @@ def make_env(env_cfg: EnvConfig, seed: int) -> GeneralsEnvWithMemory:
     kwargs = {"seed": int(seed)}
     if env_cfg.max_halfturns is not None:
         kwargs["max_halfturns"] = int(env_cfg.max_halfturns)
+    if getattr(env_cfg, "forbid_mode1", False):
+        kwargs["forbid_mode1"] = True
     return GeneralsEnvWithMemory(**kwargs)
 
 def reset_episode(env: Optional[GeneralsEnvWithMemory], env_cfg: EnvConfig, seeder: EpisodeSeeder) -> Tuple[GeneralsEnvWithMemory, Any, Any]:

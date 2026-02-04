@@ -1,10 +1,9 @@
 from __future__ import annotations
 import os, copy, torch
 from typing import Dict, List
-from ..models.policy_rope_factorized import SeqPPOPolicyRoPEFactorized
 
-def save_checkpoint(path: str, policy: SeqPPOPolicyRoPEFactorized, optimizer, update: int, ep_count: int, win_count: int,
-                   opponent_pool: List[SeqPPOPolicyRoPEFactorized], rng_state: Dict, config: Dict):
+def save_checkpoint(path: str, policy, optimizer, update: int, ep_count: int, win_count: int,
+                   opponent_pool: List, rng_state: Dict, config: Dict):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     pool_state = [p.state_dict() for p in opponent_pool]
     torch.save({
@@ -18,8 +17,8 @@ def save_checkpoint(path: str, policy: SeqPPOPolicyRoPEFactorized, optimizer, up
         "config": config,
     }, path)
 
-def load_checkpoint(path: str, policy: SeqPPOPolicyRoPEFactorized, optimizer, device, opponent_pool_max: int) -> Dict:
-    ckpt = torch.load(path, map_location="cpu")
+def load_checkpoint(path: str, policy, optimizer, device, opponent_pool_max: int) -> Dict:
+    ckpt = torch.load(path, map_location="cpu", weights_only=False)
     policy.load_state_dict(ckpt["policy"])
     optimizer.load_state_dict(ckpt["optimizer"])
     pool_state = ckpt.get("opponent_pool", [])
