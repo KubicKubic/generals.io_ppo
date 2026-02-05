@@ -48,15 +48,15 @@ def train(cfg: TrainConfig, device=None):
         T=int(cfg.T),
         img_channels=20,
         meta_dim=10,
-        rope=cfg.model.rope,
-        spatial=cfg.model.spatial,
         st_rope2d=cfg.model.st_rope2d,
+        st_axial2d=cfg.model.st_axial2d,
     ).to(device)
     optimizer = optim.Adam(policy.parameters(), lr=float(cfg.lr))
 
     opponent_pool = []
     ep_count = 0
     win_count = 0
+    lose_count = 0
     start_update = 1
 
     # ---- terminal-only (exclude truncated) averages ----
@@ -101,6 +101,7 @@ def train(cfg: TrainConfig, device=None):
         opponent_pool = ck["opponent_pool"]
         ep_count = ck["ep_count"]
         win_count = ck["win_count"]
+        lose_count = ck["lose_count"]
         start_update = ck["update"] + 1
 
         if ck.get("rng_state") is not None:
@@ -232,8 +233,11 @@ def train(cfg: TrainConfig, device=None):
                 ep_count += 1
 
                 # win count (only meaningful on terminated)
-                if res.terminated and res.info.get("winner", None) == int(Owner.P0):
-                    win_count += 1
+                if res.terminated:
+                    if res.info.get("winner", None) == int(Owner.P0):
+                        win_count += 1
+                    else:
+                        lose_count += 1
 
                 # ✅ terminal-only stats (exclude truncated episodes)
                 if res.terminated or res.truncated:
@@ -288,6 +292,7 @@ def train(cfg: TrainConfig, device=None):
                 update=upd,
                 ep_count=ep_count,
                 win_count=win_count,
+                lose_count=lose_count,
                 opponent_pool=opponent_pool,
                 rng_state=rng_state,
                 config=config_for_ckpt,
@@ -318,6 +323,7 @@ def train(cfg: TrainConfig, device=None):
                 update=upd,
                 ep_count=ep_count,
                 win_count=win_count,
+                lose_count=lose_count,
                 opponent_pool=opponent_pool,
                 rng_state=rng_state,
                 config=config_for_ckpt,
@@ -327,7 +333,8 @@ def train(cfg: TrainConfig, device=None):
         # ---- logging ----
         if int(cfg.log_every) > 0 and upd % int(cfg.log_every) == 0:
             wr = win_count / max(1, ep_count)
-            msg = f"[upd {upd:4d}] episodes={ep_count:6d} win_rate={wr:.3f} pool={len(opponent_pool)}"
+            lr = lose_count / max(1, ep_count)
+            msg = f"[upd {upd:4d}] episodes={ep_count:6d} win_rate={wr:.3f} lose_rate={lr:.3f} pool={len(opponent_pool)}"
 
             if term_n > 0:
                 avg_p0_army = term_sum_p0_army / term_n

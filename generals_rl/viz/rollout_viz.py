@@ -9,20 +9,11 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+import imageio.v2 as imageio
+from PIL import Image, ImageDraw, ImageFont
+
+from ..env.generals_env import Owner, TileType
 from ..env.generals_env_memory import GeneralsEnvWithMemory
-from ..video.checkpoint_video import render_full_frame  # 你已修好的 renderer（带 top padding 的版本）
-
-try:
-    import imageio.v2 as imageio
-except Exception:
-    imageio = None
-
-try:
-    from PIL import Image, ImageDraw
-except Exception:
-    Image = None
-    ImageDraw = None
-
 
 # ----------------------------
 # Viz state
@@ -44,6 +35,247 @@ class VizState:
     topk_actions: int
     draw_arrows: bool
     print_topk: bool
+
+# ---------- rendering helpers ----------
+def _clamp(x, lo, hi):
+    return max(lo, min(hi, x))
+
+
+def _mix(a, b, w=0.5):
+    return tuple(int(_clamp(a[i] * (1 - w) + b[i] * w, 0, 255)) for i in range(3))
+
+
+# ---------- palette ----------
+C_BG = (16, 16, 20)
+C_GRID = (35, 35, 45)
+
+C_NEUTRAL = (92, 92, 105)
+
+C_SELF = (70, 120, 210)
+C_ENEMY = (210, 90, 90)
+
+C_MOUNTAIN = (30, 30, 35)
+C_CITY_TINT = (150, 120, 70)
+C_GENERAL_TINT = (240, 210, 80)
+
+
+# ---------- robust enum helpers ----------
+def _enum_payload(e):
+    """Return candidate representations for enum-like object e."""
+    outs = [e]
+    v = getattr(e, "value", None)
+    if v is not None:
+        outs.append(v)
+    try:
+        outs.append(int(e))
+    except Exception:
+        pass
+    if v is not None:
+        try:
+            outs.append(int(v))
+        except Exception:
+            pass
+    return outs
+
+
+def _eq_enumish(x, const) -> bool:
+    """Robust equality: expand payload for BOTH sides and compare."""
+    xs = _enum_payload(x)
+    cs = _enum_payload(const)
+
+    for a in xs:
+        for b in cs:
+            try:
+                if a == b:
+                    return True
+            except Exception:
+                pass
+
+    for a in xs:
+        for b in cs:
+            try:
+                if int(a) == int(b):
+                    return True
+            except Exception:
+                pass
+
+    return False
+
+
+def _to_int_enumish(x, fallback: int = 0) -> int:
+    """Best-effort convert enum-ish / numpy scalar / int to int."""
+    for a in _enum_payload(x):
+        try:
+            return int(a)
+        except Exception:
+            pass
+    return int(fallback)
+
+
+def render_full_frame(
+    env_mem: GeneralsEnvWithMemory,
+    cell: int = 20,
+    draw_text: bool = True,
+    pov_player: int = 0,
+    hud_height: int = 14,     # top padding height
+    draw_hud: bool = True,    # set False to disable HUD entirely
+) -> np.ndarray:
+    """
+    Render full true state.
+
+    Fixes:
+      - "black background + white numbers" (numpy/PIL desync) by drawing tiles/grid in numpy first,
+        then converting to PIL to draw text/HUD.
+      - HUD covering the board by adding TOP PADDING (hud_height) and shifting the board down.
+    """
+    env = env_mem.env
+    H, W = env.H, env.W
+
+    # ---------- robust enum/int helpers ----------
+    def _enum_payload(e):
+        outs = [e]
+        v = getattr(e, "value", None)
+        if v is not None:
+            outs.append(v)
+        try:
+            outs.append(int(e))
+        except Exception:
+            pass
+        if v is not None:
+            try:
+                outs.append(int(v))
+            except Exception:
+                pass
+        return outs
+
+    def _to_int_enumish(x, fallback: int = 0) -> int:
+        for a in _enum_payload(x):
+            try:
+                return int(a)
+            except Exception:
+                pass
+        return int(fallback)
+
+    # robust constants
+    O_NEU = _to_int_enumish(Owner.NEUTRAL)
+    O_P0  = _to_int_enumish(Owner.P0)
+    O_P1  = _to_int_enumish(Owner.P1)
+
+    T_MOUNTAIN = _to_int_enumish(TileType.MOUNTAIN)
+    T_CITY     = _to_int_enumish(TileType.CITY)
+    T_GENERAL  = _to_int_enumish(TileType.GENERAL)
+
+    pov_owner = O_P0 if pov_player == 0 else O_P1
+    opp_owner = O_P1 if pov_player == 0 else O_P0
+
+    def owner_base_color(o_int: int):
+        if o_int == O_NEU:
+            return C_NEUTRAL
+        if o_int == pov_owner:
+            return C_SELF
+        if o_int == opp_owner:
+            return C_ENEMY
+        return C_NEUTRAL
+
+    # ---------- top padding ----------
+    pad_top = hud_height if (draw_text and draw_hud) else 0
+
+    # ---------- Phase 1: draw tiles + grid into numpy ----------
+    img = np.zeros((pad_top + H * cell, W * cell, 3), dtype=np.uint8)
+    img[:] = C_BG
+
+    for r in range(H):
+        for c in range(W):
+            t = _to_int_enumish(env.tile_type[r, c])
+            o = _to_int_enumish(env.owner[r, c])
+
+            if t == T_MOUNTAIN:
+                col = C_MOUNTAIN
+            else:
+                base = owner_base_color(o)
+                if t == T_CITY:
+                    col = _mix(base, C_CITY_TINT, 0.65)
+                elif t == T_GENERAL:
+                    col = _mix(base, C_GENERAL_TINT, 0.72)
+                else:
+                    col = base
+
+            y0 = pad_top + r * cell
+            x0 = c * cell
+            img[y0:y0 + cell, x0:x0 + cell] = col
+
+            # grid
+            img[y0:y0 + 1, x0:x0 + cell] = C_GRID
+            img[y0:y0 + cell, x0:x0 + 1] = C_GRID
+
+    # outer border for the board area only
+    img[pad_top + H * cell - 1: pad_top + H * cell, :, :] = C_GRID
+    img[pad_top: pad_top + H * cell, W * cell - 1: W * cell, :] = C_GRID
+
+    # ---------- Phase 2: draw numbers + HUD on PIL ----------
+    if draw_text and Image is not None and ImageDraw is not None and ImageFont is not None:
+        try:
+            font = ImageFont.load_default()
+        except Exception:
+            font = None
+
+        if font is not None:
+            pil_img = Image.fromarray(img)
+            draw = ImageDraw.Draw(pil_img)
+
+            # numbers
+            for r in range(H):
+                for c in range(W):
+                    t = _to_int_enumish(env.tile_type[r, c])
+                    if t == T_MOUNTAIN:
+                        continue
+
+                    a = int(env.army[r, c])
+                    if a <= 0:
+                        continue
+
+                    o = _to_int_enumish(env.owner[r, c])
+                    y0 = pad_top + r * cell
+                    x0 = c * cell
+
+                    if o == pov_owner:
+                        tc = (235, 245, 255)
+                    elif o == opp_owner:
+                        tc = (255, 235, 235)
+                    else:
+                        tc = (220, 220, 230)
+
+                    draw.text((x0 + 2, y0 + 1), str(a), fill=tc, font=font)
+
+            # HUD in top padding area
+            if draw_hud and pad_top > 0:
+                turn = env.half_t // 2
+                half_in_turn = env.half_t % 2
+
+                # robust scan for army/land
+                flat_owner = env.owner.reshape(-1).tolist()
+                flat_army = env.army.reshape(-1).tolist()
+                army0 = army1 = land0 = land1 = 0
+                for oo, aa in zip(flat_owner, flat_army):
+                    oi = _to_int_enumish(oo)
+                    if oi == O_P0:
+                        land0 += 1
+                        army0 += int(aa)
+                    elif oi == O_P1:
+                        land1 += 1
+                        army1 += int(aa)
+
+                hud = (
+                    f"half_t={env.half_t}  turn={turn}  half={half_in_turn} | "
+                    f"P0 army/land={army0}/{land0}  P1 army/land={army1}/{land1}"
+                )
+                # background bar (only in padding, not on board)
+                draw.rectangle((0, 0, min(W * cell, 980), pad_top), fill=(0, 0, 0))
+                draw.text((3, 0), hud, fill=(255, 255, 255), font=font)
+
+            img = np.asarray(pil_img)
+
+    return img
 
 
 def viz_begin_update(
@@ -265,99 +497,50 @@ def _draw_arrows_on_frame(
 @torch.no_grad()
 def _topk_legal_actions(
     policy,
-    x_img: torch.Tensor,        # (1,T,C,H,W)
-    x_meta: torch.Tensor,       # (1,T,M)
+    x_img: torch.Tensor,              # (1,T,C,H,W)
+    x_meta: torch.Tensor,             # (1,T,M)
     legal_action_mask: torch.Tensor,  # (1,A) bool
     k: int = 10,
 ):
     """
-    Return top-k legal actions and probs under factorized model:
-      p(a)=p(src)*p(dir|src)*p(mode|src)
+    Return top-k legal actions and probs.
+
     Supports:
-      - RoPE factorized model (pi_src + dir_mode_logits)
-      - Spatial factorized model (src_head + dm_mlp + dir_head/mode_head)
+      1) Joint-logits policies (e.g. SeqPPOPolicySTRoPE2D): logits_flat = (1, A)
+         -> p = softmax(masked_logits)
+      2) Factorized policies (old): p(a)=p(src)*p(dir|src)*p(mode|src)
     """
     assert x_img.shape[0] == 1, "viz assumes batch=1 for topk"
     B = 1
 
     A = legal_action_mask.shape[1]
-    src_size = A // 8
-    H = policy.H if hasattr(policy, "H") else None
-    W = policy.W if hasattr(policy, "W") else None
-    if H is None or W is None:
-        # fallback from env dimensions encoded in action_size
-        W = int((src_size) ** 0.5)
-        H = src_size // W
+    legal_flat = legal_action_mask[0].to(torch.bool)  # (A,)
 
-    # dm_mask: (1,src,8), src_mask: (1,src)
-    dm_mask = legal_action_mask.view(B, src_size, 8)
-    src_mask = dm_mask.any(dim=-1)  # (1,src)
+    # -------------------------
+    # (1) NEW: Joint logits policy (policy_st_rope2d.py)
+    # -------------------------
+    if hasattr(policy, "logits_and_value"):
+        # logits_flat: (1, A)
+        logits_flat, _v = policy.logits_and_value(x_img, x_meta)
+        logits_flat = logits_flat.view(-1)  # (A,)
 
-    # ---- get src logits + per-src dir/mode logits (vectorized over src) ----
-    if hasattr(policy, "pi_src") and hasattr(policy, "global_features"):
-        # RoPE factorized
-        g, _v = policy.global_features(x_img, x_meta)         # (1,256)
-        logits_src = policy.pi_src(g)                         # (1,src)
+        # masked softmax over legal actions
+        masked_logits = logits_flat.masked_fill(~legal_flat, -1e9)
+        p_flat = F.softmax(masked_logits, dim=-1)  # (A,)
 
-        # vectorize dir/mode for all src
-        src_all = torch.arange(src_size, device=logits_src.device, dtype=torch.long)  # (src,)
-        g_rep = g.repeat(src_size, 1)                          # (src,256)
-        logits_dir_all, logits_mode_all = policy.dir_mode_logits(g_rep, src_all)     # (src,4),(src,2)
+        # if all zeros (shouldn't), fallback
+        if float(p_flat.sum().item()) <= 0:
+            legal_idx = torch.nonzero(legal_flat).view(-1)
+            kk = min(int(k), int(legal_idx.numel()))
+            top_a = legal_idx[:kk]
+            top_p = torch.ones_like(top_a, dtype=torch.float32) / max(1, kk)
+            return top_a.tolist(), top_p.tolist()
 
-    elif hasattr(policy, "src_head") and hasattr(policy, "spatial_features"):
-        # Spatial factorized
-        Fmap, _v = policy.spatial_features(x_img, x_meta)      # (1,D,H,W)
-        logits_src_map = policy.src_head(Fmap).squeeze(1)      # (1,H,W)
-        logits_src = logits_src_map.view(1, -1)                # (1,src)
+        kk = min(int(k), int(legal_flat.sum().item()))
+        top_p, top_a = torch.topk(p_flat, k=kk, largest=True, sorted=True)
+        return top_a.tolist(), top_p.tolist()
 
-        # all src cell embeddings: (src,D)
-        D = Fmap.shape[1]
-        flat = Fmap.view(1, D, H, W).reshape(D, H * W).transpose(0, 1).contiguous()  # (src,D)
-        h = policy.dm_mlp(flat)                                # (src,D)
-        logits_dir_all = policy.dir_head(h)                    # (src,4)
-        logits_mode_all = policy.mode_head(h)                  # (src,2)
-    else:
-        raise RuntimeError("Unknown policy type for topk action viz.")
-
-    # ---- masked softmax for src ----
-    logits_src_masked = logits_src.masked_fill(~src_mask, -1e9)  # (1,src)
-    p_src = F.softmax(logits_src_masked, dim=-1).view(-1)        # (src,)
-
-    # ---- per-src masked softmax for dir/mode ----
-    dm = dm_mask[0].view(src_size, 4, 2)                         # (src,4,2)
-    dir_mask = dm.any(dim=-1)                                    # (src,4)
-    mode_mask = dm.any(dim=-2)                                   # (src,2)
-
-    # logits_dir_all: (src,4), logits_mode_all: (src,2)
-    ld = logits_dir_all.masked_fill(~dir_mask, -1e9)
-    lm = logits_mode_all.masked_fill(~mode_mask, -1e9)
-    p_dir = F.softmax(ld, dim=-1)                                # (src,4)
-    p_mode = F.softmax(lm, dim=-1)                               # (src,2)
-
-    # ---- build probs for all flat actions (src,4,2) ----
-    p_pair = p_dir.unsqueeze(-1) * p_mode.unsqueeze(-2)          # (src,4,2)
-    # zero out illegal dm
-    legal_dm = dm_mask[0].view(src_size, 4, 2).to(torch.float32)
-    p_pair = p_pair * legal_dm
-    # multiply by p_src
-    p_pair = p_pair * p_src.view(src_size, 1, 1)
-
-    p_flat = p_pair.reshape(src_size * 8)                        # (A,)
-    legal_flat = legal_action_mask[0].to(torch.bool)             # (A,)
-    p_flat = p_flat.masked_fill(~legal_flat, 0.0)
-
-    # if all zeros (shouldn't), fallback
-    if float(p_flat.sum().item()) <= 0:
-        legal_idx = torch.nonzero(legal_flat).view(-1)
-        top_idx = legal_idx[:k]
-        top_p = torch.ones_like(top_idx, dtype=torch.float32) / max(1, len(top_idx))
-        return top_idx.tolist(), top_p.tolist()
-
-    # topk
-    k = min(int(k), int(legal_flat.sum().item()))
-    top_p, top_a = torch.topk(p_flat, k=k, largest=True, sorted=True)
-    return top_a.tolist(), top_p.tolist()
-
+    assert False
 
 # ----------------------------
 # Main viz hook

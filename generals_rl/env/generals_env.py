@@ -8,10 +8,10 @@
 #  - Each env.step() = ONE half-turn (obs updates every half-turn)
 #  - Each turn = 2 half-turns; growth happens ONCE per turn (after the 2nd half-turn)
 #  - Move execution order inside a half-turn decided by a priority system (sequential execution)
-#  - Variable "real" map size sampled uniformly from 15..25 (both H and W),
+#  - Variable "real" map size sampled uniformly from [min_real_size .. max_real_size] (both H and W),
 #    embedded in a fixed 25x25 grid; outside real area is filled with mountains.
 #  - HARD constraints:
-#       * Manhattan distance between the two generals >= 15
+#       * Manhattan distance between the two generals >= min_general_dist
 #       * The two generals must be connected via passable land (non-mountain tiles)
 
 from __future__ import annotations
@@ -104,7 +104,7 @@ class GeneralsEnv:
     Two-player generals-like env.
 
     Fixed grid is self.H x self.W (defaults 25x25).
-    Each reset samples a "real" map size (real_H, real_W) uniformly from 15..25,
+    Each reset samples a "real" map size (real_H, real_W) uniformly from [min_real_size..max_real_size],
     and fills outside [0:real_H, 0:real_W] with mountains.
 
     State tensors (H, W):
@@ -123,6 +123,10 @@ class GeneralsEnv:
       - turn: turn index as array([turn])
       - half_in_turn: array([0 or 1])
       - real_shape: array([real_H, real_W])
+
+    Map generation knobs (init-time adjustable):
+      - mountain_ratio_low/high: ratio range for internal mountains (on real area), inclusive-ish
+      - city_count_low/high: integer range for number of neutral cities
     """
 
     def __init__(
@@ -142,9 +146,18 @@ class GeneralsEnv:
         enable_chase_priority: bool = True,
 
         # map constraints
-        min_real_size: int = 15,
-        max_real_size: int = 25,
-        min_general_dist: int = 15,
+        # min_real_size: int = 15,
+        # max_real_size: int = 25,
+        # min_general_dist: int = 15,
+        min_real_size: int = 5,
+        max_real_size: int = 8,
+        min_general_dist: int = 6,
+
+        # map distribution knobs (NEW)
+        mountain_ratio_low: float = 1.0 / 8.0,
+        mountain_ratio_high: float = 1.0 / 4.0,
+        city_count_low: int = 4,
+        city_count_high: int = 10,
 
         # action-space constraint
         forbid_mode1: bool = False,
@@ -170,6 +183,22 @@ class GeneralsEnv:
         self.min_real_size = int(min_real_size)
         self.max_real_size = int(max_real_size)
         self.min_general_dist = int(min_general_dist)
+
+        # Map distribution knobs (NEW)
+        self.mountain_ratio_low = float(mountain_ratio_low)
+        self.mountain_ratio_high = float(mountain_ratio_high)
+        self.city_count_low = int(city_count_low)
+        self.city_count_high = int(city_count_high)
+
+        # Basic validation for knobs (NEW)
+        if not (0.0 <= self.mountain_ratio_low <= self.mountain_ratio_high <= 1.0):
+            raise ValueError(
+                f"Invalid mountain_ratio range: [{self.mountain_ratio_low}, {self.mountain_ratio_high}]"
+            )
+        if not (0 <= self.city_count_low <= self.city_count_high):
+            raise ValueError(
+                f"Invalid city_count range: [{self.city_count_low}, {self.city_count_high}]"
+            )
 
         # If True, disallow actions with mode==1 when computing legal action masks.
         self.forbid_mode1 = bool(forbid_mode1)
@@ -284,7 +313,7 @@ class GeneralsEnv:
     # -----------------------------
     # Map generation
     # -----------------------------
-    
+
     def _generate_map(self):
         """
         Map generation (real area only, excluding the padded mountains outside real_H/real_W):
@@ -293,8 +322,10 @@ class GeneralsEnv:
           - outside real area filled with mountains
           - place 2 generals on EMPTY tiles with Manhattan distance >= min_general_dist
           - sample:
-                * mountain ratio in [1/8, 1/4]  => a = floor(ratio * area)
-                * city count in [4, 10]         => b
+                * mountain ratio in [mountain_ratio_low, mountain_ratio_high]
+                    => a = floor(ratio * area)
+                * city count in [city_count_low, city_count_high]
+                    => b
           - then:
                 * repeat a times: pick a LEGAL EMPTY tile and turn it into a mountain
                 * repeat b times: pick a LEGAL EMPTY tile and turn it into a neutral city
@@ -319,9 +350,9 @@ class GeneralsEnv:
                 continue
 
             # Sample counts (inside real area only)
-            ratio = float(self.rng.uniform(1.0 / 8.0, 1.0 / 4.0))
+            ratio = float(self.rng.uniform(self.mountain_ratio_low, self.mountain_ratio_high))
             a = int(np.floor(ratio * area))  # number of internal mountains
-            b = int(self.rng.integers(4, 11))  # number of cities
+            b = int(self.rng.integers(self.city_count_low, self.city_count_high + 1))  # number of cities
 
             # Place a mountains then b cities, each step must keep generals connected via EMPTY land
             if not self._place_mountains_and_cities_conditional(a=a, b=b):
@@ -352,20 +383,6 @@ class GeneralsEnv:
         self.general_pos[Owner.P0] = None
         self.general_pos[Owner.P1] = None
 
-    def _place_internal_mountains(self):
-        """
-        Place additional mountains within the real area.
-        Uses simple random placement with collisions possible (so actual count <= target).
-        """
-        area = self.real_H * self.real_W
-        n_m = area // 12
-        for _ in range(n_m):
-            r = int(self.rng.integers(0, self.real_H))
-            c = int(self.rng.integers(0, self.real_W))
-            self.tile_type[r, c] = TileType.MOUNTAIN
-            # owner/army stay neutral/0
-
-    
     def _generals_connected_via_empty(self) -> bool:
         """
         Check if the two generals are connected via EMPTY land (plus endpoints on GENERAL),
@@ -539,68 +556,6 @@ class GeneralsEnv:
 
         return False
 
-    def _generals_connected(self) -> bool:
-        """
-        Check if two generals are connected via passable land (non-mountain tiles),
-        within the real area.
-        """
-        g0 = self.general_pos[Owner.P0]
-        g1 = self.general_pos[Owner.P1]
-        if g0 is None or g1 is None:
-            return False
-
-        (sr, sc) = g0
-        (tr, tc) = g1
-
-        # BFS on passable cells: tile_type != MOUNTAIN
-        passable = (self.tile_type[: self.real_H, : self.real_W] != TileType.MOUNTAIN)
-
-        if not passable[sr, sc] or not passable[tr, tc]:
-            return False
-
-        q_r = np.empty(self.real_H * self.real_W, dtype=np.int32)
-        q_c = np.empty(self.real_H * self.real_W, dtype=np.int32)
-        head = 0
-        tail = 0
-
-        visited = np.zeros((self.real_H, self.real_W), dtype=np.bool_)
-        visited[sr, sc] = True
-        q_r[tail] = sr
-        q_c[tail] = sc
-        tail += 1
-
-        while head < tail:
-            r = int(q_r[head])
-            c = int(q_c[head])
-            head += 1
-
-            if (r, c) == (tr, tc):
-                return True
-
-            # 4-neighbors
-            if r > 0 and (not visited[r - 1, c]) and passable[r - 1, c]:
-                visited[r - 1, c] = True
-                q_r[tail] = r - 1
-                q_c[tail] = c
-                tail += 1
-            if r + 1 < self.real_H and (not visited[r + 1, c]) and passable[r + 1, c]:
-                visited[r + 1, c] = True
-                q_r[tail] = r + 1
-                q_c[tail] = c
-                tail += 1
-            if c > 0 and (not visited[r, c - 1]) and passable[r, c - 1]:
-                visited[r, c - 1] = True
-                q_r[tail] = r
-                q_c[tail] = c - 1
-                tail += 1
-            if c + 1 < self.real_W and (not visited[r, c + 1]) and passable[r, c + 1]:
-                visited[r, c + 1] = True
-                q_r[tail] = r
-                q_c[tail] = c + 1
-                tail += 1
-
-        return False
-
     def _place_neutral_cities(self):
         """
         Place neutral cities in the real area on EMPTY cells.
@@ -645,7 +600,7 @@ class GeneralsEnv:
 
         vis |= expand
         return vis
-    
+
     def _compute_scores(self) -> Tuple[int, int, int, int]:
         """
         Returns:

@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any, Dict
 
 from .policy_st_rope2d import SeqPPOPolicySTRoPE2D
+from .policy_st_axial2d import SeqPPOPolicySTAxial2D
 
 
 def make_policy(
@@ -14,9 +15,8 @@ def make_policy(
     T: int,
     img_channels: int = 20,
     meta_dim: int = 10,
-    rope: Dict[str, Any] | None = None,
-    spatial: Dict[str, Any] | None = None,
     st_rope2d: Dict[str, Any] | None = None,
+    st_axial2d: Dict[str, Any] | None = None,
 ):
     """Factory for selecting policy architecture by name.
 
@@ -30,9 +30,7 @@ def make_policy(
       - For Spatial model: pass keys like d/meta_proj
     """
     print(name)
-    n = (name or "rope_factorized").lower()
-    rope = rope or {}
-    spatial = spatial or {}
+    n = (name or "st_axial2d").lower()
     st_rope2d = st_rope2d or {}
 
     if n in ("st_rope2d", "st-rope2d", "spatiotemporal_rope2d", "spatiotemporal-rope2d"):
@@ -41,6 +39,14 @@ def make_policy(
             img_channels=img_channels,
             meta_dim=meta_dim,
             **st_rope2d,
+        )
+
+    if n in ("st_axial2d", "st-axial2d", "spatiotemporal_axial2d", "spatiotemporal-axial2d"):
+        return SeqPPOPolicySTAxial2D(
+            H=H, W=W,
+            img_channels=img_channels,
+            meta_dim=meta_dim,
+            **st_axial2d,
         )
 
     raise ValueError(

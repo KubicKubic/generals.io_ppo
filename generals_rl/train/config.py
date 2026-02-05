@@ -13,16 +13,16 @@ from typing import Any, Dict, Optional
 class PPOConfig:
     clip_eps: float = 0.2
     vf_coef: float = 0.5
-    ent_coef: float = 0.01
-    epochs: int = 4
-    minibatch: int = 16
+    ent_coef: float = 0.1
+    epochs: int = 1
+    minibatch: int = 256
     max_grad_norm: float = 1.0
 
 
 @dataclass
 class RewardShapingConfig:
-    w_army: float = 0.00025
-    w_land: float = 0.0015
+    w_army: float = 0.1
+    w_land: float = 0.1
 
 
 @dataclass
@@ -32,72 +32,76 @@ class OpponentConfig:
     pool_empty_mode: str = "random"   # "random" | "self"
     fallback_mode: str = "random"     # "random" | "self"
     snapshot_every: int = 25
-    opponent_pool_max: int = 12
+    opponent_pool_max: int = 0
 
 
 @dataclass
 class VideoConfig:
     make_video: bool = False
-    videos_dir: str = "videos"
-    fps: int = 15
-    seed: int = 123
-    max_halfturns: int = 800
-    cell: int = 20
-    draw_text: bool = True
-    pov_player: int = 0
 
 
 @dataclass
 class VizConfig:
-    enable: bool = False
+    enable: bool = True
     out_dir: str = "samples_viz"
-    every_updates: int = 10
-    frames_per_update: int = 8
+    every_updates: int = 8
+    frames_per_update: int = 512
     save_mp4: bool = True
-    mp4_fps: int = 8
+    mp4_fps: int = 2
     save_trace_jsonl: bool = True
     cell: int = 20
     draw_text: bool = True
     pov_player: int = 0
     reset_episode_before_viz: bool = False
-    topk_actions: int = 10
+    topk_actions: int = 3
 
 
 @dataclass
 class EnvConfig:
     base_seed: int = 0
-    max_halfturns: Optional[int] = None
+    max_halfturns: Optional[int] = 50
     reset_seed_mode: str = "increment"   # "fixed" | "increment" | "random"
     seed_increment: int = 1
-    # If True, disallow actions with mode m=1 (i.e., keep only m=0).
-    forbid_mode1: bool = False
+    forbid_mode1: bool = True
 
 
 @dataclass
 class ModelConfig:
     """
-    Model selection + kwargs passed into generals_rl.models.registry.make_policy.
+    Model selection + kwargs forwarded into generals_rl.models.registry.make_policy.
 
-    name:
-      - "rope_factorized"
-      - "spatial_factorized"
-    rope/spatial:
-      - extra kwargs forwarded to the corresponding model constructor
+    This version is aligned to your YAML:
+      model:
+        name: st_axial2d
+        st_rope2d: {...}
+        st_axial2d: {...}
+
+    So we only keep: name, st_rope2d, st_axial2d.
     """
-    name: str = "rope_factorized"
-    rope: Dict[str, Any] = field(default_factory=dict)
-    spatial: Dict[str, Any] = field(default_factory=lambda: {"d": 128, "meta_proj": 16})
-    # New spatiotemporal RoPE-Transformer policy (keeps spatial structure; RoPE Transformer over time per-cell).
-    st_rope2d: Dict[str, Any] = field(
-        default_factory=lambda: {
-            "enc_hidden": 64,     # conv hidden for per-frame encoder
-            "d_model": 64,   # transformer d_model over time (must be divisible by nhead and head_dim even)
-            "nhead": 4,
-            "nlayers": 2,
-            "dropout": 0.0,
-            "head_hidden": 64,    # conv hidden for action head
-        }
-    )
+    name: str = "st_axial2d"
+
+    st_rope2d: Dict[str, Any] = field(default_factory=lambda: {
+        "meta_proj": 16,
+        "d_model": 64,
+        "nhead": 4,
+        "nlayers": 2,
+        "dropout": 0.0,
+        "enc_hidden": 128,
+        "enc_depth": 3,
+        "head_hidden": 128,
+        "head_depth": 3,
+    })
+
+    st_axial2d: Dict[str, Any] = field(default_factory=lambda: {
+        "meta_proj": 16,
+        "d_model": 64,
+        "nhead_time": 4,
+        "nlayers_time": 2,
+        "dropout": 0.0,
+        "nhead_axial": 8,
+        "nlayers_axial_enc": 2,
+        "nlayers_axial_head": 2,
+    })
 
 
 # -----------------------------
@@ -107,16 +111,16 @@ class ModelConfig:
 class TrainConfig:
     # main training
     total_updates: int = 1200
-    rollout_len: int = 128
+    rollout_len: int = 2048
     T: int = 100
-    lr: float = 2.5e-4
+    lr: float = 1e-3
     gamma: float = 0.99
     lam: float = 0.95
 
     # io/logging
     ckpt_dir: str = "checkpoints"
-    save_every: int = 50
-    log_every: int = 10
+    save_every: int = 8
+    log_every: int = 1
     resume_path: Optional[str] = None
     save_policy_path: str = "generals_seq_policy.pt"
     save_resolved_config: bool = True
@@ -174,7 +178,6 @@ def load_config(path: str) -> TrainConfig:
             raise RuntimeError("YAML config requires PyYAML. Please: pip install pyyaml") from e
         data = yaml.safe_load(text) or {}
     else:
-        # best effort
         try:
             data = json.loads(text)
         except Exception:
@@ -196,7 +199,6 @@ def load_config(path: str) -> TrainConfig:
     model_d = merged.get("model", {}) or {}
     viz_d = merged.get("viz", {}) or {}
 
-    # rebuild dataclasses explicitly (avoids subtle typing/default issues)
     cfg = TrainConfig(
         total_updates=int(merged["total_updates"]),
         rollout_len=int(merged["rollout_len"]),
@@ -206,30 +208,22 @@ def load_config(path: str) -> TrainConfig:
         lam=float(merged["lam"]),
         ckpt_dir=str(merged["ckpt_dir"]),
         save_every=int(merged["save_every"]),
-        log_every=int(merged.get("log_every", 10)),
+        log_every=int(merged["log_every"]),
         resume_path=merged.get("resume_path", None),
         save_policy_path=str(merged.get("save_policy_path", "generals_seq_policy.pt")),
         save_resolved_config=bool(merged.get("save_resolved_config", True)),
         seq_padding=bool(merged.get("seq_padding", False)),
         env=EnvConfig(
             base_seed=int(env_d.get("base_seed", 0)),
-            max_halfturns=env_d.get("max_halfturns", None),
+            max_halfturns=env_d.get("max_halfturns", 50),
             reset_seed_mode=str(env_d.get("reset_seed_mode", "increment")),
             seed_increment=int(env_d.get("seed_increment", 1)),
-            forbid_mode1=bool(env_d.get("forbid_mode1", False)),
+            forbid_mode1=bool(env_d.get("forbid_mode1", True)),
         ),
         model=ModelConfig(
-            name=str(model_d.get("name", "rope_factorized")),
-            rope=dict(model_d.get("rope", {}) or {}),
-            spatial=dict(model_d.get("spatial", {}) or {"d": 128, "meta_proj": 16}),
-            st_rope2d=dict(model_d.get("st_rope2d", {}) or {
-                "enc_hidden": 64,
-                "d_model": 64,
-                "nhead": 4,
-                "nlayers": 2,
-                "dropout": 0.0,
-                "head_hidden": 64,
-            }),
+            name=str(model_d.get("name", "st_axial2d")),
+            st_rope2d=dict(model_d.get("st_rope2d", {}) or {}),
+            st_axial2d=dict(model_d.get("st_axial2d", {}) or {}),
         ),
         ppo=PPOConfig(**(merged.get("ppo", {}) or {})),
         opponent=OpponentConfig(**(merged.get("opponent", {}) or {})),
