@@ -56,8 +56,26 @@ class VizConfig:
     topk_actions: int = 3
 
 
+
+@dataclass
+class MCTSConfig:
+    enabled: bool = False
+    actor_mode: str = "ppo"            # "ppo" | "mcts"
+    num_simulations: int = 100
+    max_depth: int = 40
+    c_puct: float = 1.5
+    tau: float = 1.0
+    deterministic: bool = False
+    dirichlet_alpha: float = 0.0
+    dirichlet_eps: float = 0.0
+    topk_actions: int = 0
+    opponent_model: str = "policy"     # "policy" | "random"
+    opponent_sample: str = "sample"    # "sample" | "argmax"
+
+
 @dataclass
 class EnvConfig:
+    num_envs: int = 1
     base_seed: int = 0
     max_halfturns: Optional[int] = 50
     reset_seed_mode: str = "increment"   # "fixed" | "increment" | "random"
@@ -134,6 +152,7 @@ class TrainConfig:
     reward_shaping: RewardShapingConfig = field(default_factory=RewardShapingConfig)
     video: VideoConfig = field(default_factory=VideoConfig)
     viz: VizConfig = field(default_factory=VizConfig)
+    mcts: MCTSConfig = field(default_factory=MCTSConfig)
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -214,6 +233,7 @@ def load_config(path: str) -> TrainConfig:
         save_resolved_config=bool(merged.get("save_resolved_config", True)),
         seq_padding=bool(merged.get("seq_padding", False)),
         env=EnvConfig(
+            num_envs=int(env_d.get("num_envs", 1)),
             base_seed=int(env_d.get("base_seed", 0)),
             max_halfturns=env_d.get("max_halfturns", 50),
             reset_seed_mode=str(env_d.get("reset_seed_mode", "increment")),
@@ -230,6 +250,7 @@ def load_config(path: str) -> TrainConfig:
         reward_shaping=RewardShapingConfig(**(merged.get("reward_shaping", {}) or {})),
         video=VideoConfig(**(merged.get("video", {}) or {})),
         viz=VizConfig(**(viz_d or {})),
+        mcts=MCTSConfig(**(merged.get("mcts", {}) or {})),
     )
     return cfg
 

@@ -1,5 +1,5 @@
 total_updates: 1200
-rollout_len: 8192
+rollout_len: 128
 T: 1
 lr: 1e-3
 gamma: 0.99
@@ -7,13 +7,14 @@ lam: 0.95
 ckpt_dir: checkpoints
 save_every: 16
 log_every: 1
-resume_path: null
+resume_path: /qiyuan_research_vepfs_001/guoyuchong/my/generals_ppo/checkpoints/ckpt_000096.pt
 save_policy_path: generals_seq_policy.pt
 save_resolved_config: true
 seq_padding: false
 env:
+  num_envs: 1
   base_seed: 0
-  max_halfturns: 50
+  max_halfturns: 128
   reset_seed_mode: increment
   seed_increment: 1
   forbid_mode1: true
@@ -22,7 +23,7 @@ ppo:
   vf_coef: 0.5
   ent_coef: 0.1
   epochs: 1
-  minibatch: 2048
+  minibatch: 128
   max_grad_norm: 1.0
 reward_shaping:
   w_army: 0.1
@@ -34,6 +35,19 @@ opponent:
   fallback_mode: random
   snapshot_every: 25
   opponent_pool_max: 0
+mcts:
+  enabled: true
+  actor_mode: mcts          # ppo | mcts
+  num_simulations: 100
+  max_depth: 10
+  c_puct: 1.5
+  tau: 1.0
+  deterministic: false
+  dirichlet_alpha: 0.0
+  dirichlet_eps: 0.0
+  topk_actions: 8
+  opponent_model: policy   # policy | random
+  opponent_sample: sample  # sample | argmax
 video:
   make_video: false
 viz:
@@ -51,15 +65,13 @@ viz:
   topk_actions: 3
 model:
   # Choose one of: rope_factorized | spatial_factorized | st_rope2d
-  name: st_rope2d
-  rope: {}
-  spatial:
-    d: 128
+  name: st_axial2d
+  st_axial2d:
     meta_proj: 16
-  st_rope2d:
-    enc_hidden: 64
-    d_model: 64
-    nhead: 4
-    nlayers: 2
+    d_model: 32
+    nhead_time: 4
+    nlayers_time: 2
     dropout: 0.0
-    head_hidden: 64
+    nhead_axial: 8
+    nlayers_axial_enc: 2
+    nlayers_axial_head: 2

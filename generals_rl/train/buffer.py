@@ -1,7 +1,10 @@
 from __future__ import annotations
+
 from dataclasses import dataclass
 from typing import List
+
 import torch
+
 
 @dataclass
 class Batch:
@@ -16,53 +19,139 @@ class Batch:
     adv: torch.Tensor
     ret: torch.Tensor
 
+
+def _left_pad_repeat_first(x: torch.Tensor, T: int) -> torch.Tensor:
+    """
+    Left-pad along time dim (dim=1) by repeating the first frame.
+
+    x: (B, t, ...)
+    returns: (B, T, ...)
+    """
+    t = int(x.shape[1])
+    if t == T:
+        return x
+    if t > T:
+        return x[:, -T:]
+    pad_len = T - t
+    pad = x[:, :1].expand(x.shape[0], pad_len, *x.shape[2:]).contiguous()
+    return torch.cat([pad, x], dim=1)
+
+
 class RolloutBuffer:
-    def __init__(self, device):
+    """
+    Vectorized rollout buffer:
+      - store per-step batched tensors (E, ...)
+      - compute GAE per-env along rollout axis (L, E)
+      - flatten to (N=L*E, ...) for PPO
+    """
+
+    def __init__(self, device: torch.device):
         self.device = device
-        self.x_img: List[torch.Tensor] = []
-        self.x_meta: List[torch.Tensor] = []
-        self.maskA: List[torch.Tensor] = []
-        self.a: List[torch.Tensor] = []
-        self.logp: List[torch.Tensor] = []
-        self.v: List[torch.Tensor] = []
-        self.r: List[float] = []
-        self.done: List[float] = []
 
-    def add(self, x_img_seq, x_meta_seq, maskA, a, logp, v, r: float, done: bool):
-        self.x_img.append(x_img_seq)
-        self.x_meta.append(x_meta_seq)
-        self.maskA.append(maskA)
-        self.a.append(a)
-        self.logp.append(logp)
-        self.v.append(v)
-        self.r.append(float(r))
-        self.done.append(1.0 if done else 0.0)
+        self.x_img_steps: List[torch.Tensor] = []   # (E, Tt, C, H, W)   (Tt may vary)
+        self.x_meta_steps: List[torch.Tensor] = []  # (E, Tt, M)         (Tt may vary)
+        self.maskA_steps: List[torch.Tensor] = []   # (E, A)
+        self.a_steps: List[torch.Tensor] = []       # (E,)
+        self.logp_steps: List[torch.Tensor] = []    # (E,)
+        self.v_steps: List[torch.Tensor] = []       # (E,)
+        self.r_steps: List[torch.Tensor] = []       # (E,)
+        self.done_steps: List[torch.Tensor] = []    # (E,)
 
-    def build(self, gamma: float, lam: float, last_v: float) -> Batch:
-        x_img = torch.stack(self.x_img).to(self.device)
-        x_meta = torch.stack(self.x_meta).to(self.device)
-        maskA = torch.stack(self.maskA).to(self.device)
-        if maskA.dtype != torch.bool:
-            maskA = maskA.to(torch.bool)
+    @property
+    def num_steps(self) -> int:
+        return len(self.r_steps)
 
-        a = torch.stack(self.a).to(self.device).long().view(-1)
-        logp = torch.stack(self.logp).to(self.device).view(-1)
-        v = torch.stack(self.v).to(self.device).view(-1)
+    @property
+    def num_envs(self) -> int:
+        return int(self.r_steps[0].shape[0]) if self.r_steps else 0
 
-        r = torch.tensor(self.r, dtype=torch.float32, device=self.device)
-        done = torch.tensor(self.done, dtype=torch.float32, device=self.device)
+    def add_step(
+        self,
+        *,
+        x_img_seq: torch.Tensor,   # (E,T,C,H,W)
+        x_meta_seq: torch.Tensor,  # (E,T,M)
+        maskA: torch.Tensor,       # (E,A)
+        a: torch.Tensor,           # (E,)
+        logp: torch.Tensor,        # (E,)
+        v: torch.Tensor,           # (E,)
+        r: torch.Tensor,           # (E,)
+        done: torch.Tensor,        # (E,) in {0,1}
+    ) -> None:
+        # store on CPU to save GPU memory
+        self.x_img_steps.append(x_img_seq.detach().cpu())
+        self.x_meta_steps.append(x_meta_seq.detach().cpu())
+        self.maskA_steps.append(maskA.detach().cpu().to(torch.bool))
+        self.a_steps.append(a.detach().cpu().long().view(-1))
+        self.logp_steps.append(logp.detach().cpu().view(-1))
+        self.v_steps.append(v.detach().cpu().view(-1))
+        self.r_steps.append(r.detach().cpu().float().view(-1))
+        self.done_steps.append(done.detach().cpu().float().view(-1))
 
-        N = r.shape[0]
-        adv = torch.zeros(N, dtype=torch.float32, device=self.device)
+    def build(self, *, gamma: float, lam: float, last_v: torch.Tensor | float) -> Batch:
+        if self.num_steps == 0:
+            raise RuntimeError("RolloutBuffer is empty")
 
-        gae = 0.0
-        for t in reversed(range(N)):
+        L = self.num_steps
+        E = self.num_envs
+
+        # pad variable T across steps to max_T so we can stack
+        Ts = [int(x.shape[1]) for x in self.x_img_steps]
+        T_max = max(Ts)
+
+        x_img_padded = [_left_pad_repeat_first(x, T_max) for x in self.x_img_steps]   # each (E,T_max,C,H,W)
+        x_meta_padded = [_left_pad_repeat_first(x, T_max) for x in self.x_meta_steps] # each (E,T_max,M)
+
+        x_img = torch.stack(x_img_padded, dim=0).to(self.device)     # (L,E,T,C,H,W)
+        x_meta = torch.stack(x_meta_padded, dim=0).to(self.device)   # (L,E,T,M)
+        maskA = torch.stack(self.maskA_steps, dim=0).to(self.device) # (L,E,A)
+        a = torch.stack(self.a_steps, dim=0).to(self.device).long()  # (L,E)
+        logp = torch.stack(self.logp_steps, dim=0).to(self.device)   # (L,E)
+        v = torch.stack(self.v_steps, dim=0).to(self.device)         # (L,E)
+        r = torch.stack(self.r_steps, dim=0).to(self.device)         # (L,E)
+        done = torch.stack(self.done_steps, dim=0).to(self.device)   # (L,E)
+
+        if not torch.is_tensor(last_v):
+            last_v = torch.tensor([float(last_v)] * E, dtype=torch.float32, device=self.device)
+        else:
+            last_v = last_v.to(self.device).float().view(E)
+
+        # GAE: vectorized over envs
+        adv = torch.zeros((L, E), dtype=torch.float32, device=self.device)
+        gae = torch.zeros((E,), dtype=torch.float32, device=self.device)
+
+        for t in reversed(range(L)):
             nonterminal = 1.0 - done[t]
-            next_value = float(last_v) if t == N - 1 else float(v[t + 1].item())
-            delta = r[t] + gamma * next_value * nonterminal - v[t]
-            gae = delta + gamma * lam * nonterminal * gae
+            next_value = last_v if t == L - 1 else v[t + 1]
+            delta = r[t] + float(gamma) * next_value * nonterminal - v[t]
+            gae = delta + float(gamma) * float(lam) * nonterminal * gae
             adv[t] = gae
 
         ret = adv + v
-        adv = (adv - adv.mean()) / (adv.std() + 1e-8)
-        return Batch(x_img, x_meta, maskA, a, logp, v, r, done, adv, ret)
+
+        # flatten (L,E,...) -> (N=L*E,...)
+        x_img_f = x_img.reshape(L * E, T_max, *x_img.shape[3:])      # (N,T,C,H,W)
+        x_meta_f = x_meta.reshape(L * E, T_max, x_meta.shape[-1])    # (N,T,M)
+        maskA_f = maskA.reshape(L * E, maskA.shape[-1])              # (N,A)
+
+        a_f = a.reshape(L * E)
+        logp_f = logp.reshape(L * E)
+        v_f = v.reshape(L * E)
+        r_f = r.reshape(L * E)
+        done_f = done.reshape(L * E)
+        adv_f = adv.reshape(L * E)
+        ret_f = ret.reshape(L * E)
+
+        adv_f = (adv_f - adv_f.mean()) / (adv_f.std() + 1e-8)
+
+        return Batch(
+            x_img=x_img_f,
+            x_meta=x_meta_f,
+            maskA=maskA_f,
+            a=a_f.long(),
+            logp=logp_f,
+            v=v_f,
+            r=r_f,
+            done=done_f,
+            adv=adv_f,
+            ret=ret_f,
+        )

@@ -1,5 +1,6 @@
-# generals_rl/train/loop.py
 from __future__ import annotations
+
+from typing import List
 
 import os
 import copy
@@ -12,39 +13,76 @@ from ..env.generals_env import Owner, TileType
 from ..data.history import ObsHistory
 from ..data.encoding import encode_obs_sequence
 from ..models.registry import make_policy
+from ..mcts.alphazero_mcts import AlphaZeroMCTSPolicy, MCTSConfig as _MCTSConfig
 
 from .config import TrainConfig
 from .rng import set_seed, get_rng_state, set_rng_state
 from .buffer import RolloutBuffer
 from .reward import phi_from_scores, potential_shaped_reward
 from .ppo import ppo_update
-from .opponent import choose_opponent_action
+from .opponent import choose_opponent_action_batched
 from .checkpoint import save_checkpoint, load_checkpoint
 from .env_reset import EpisodeSeeder, reset_episode
 
-from ..viz.rollout_viz import viz_begin_update, viz_end_update, maybe_visualize_rollout_step
+from ..viz.rollout_viz import (
+    viz_begin_update,
+    viz_end_update,
+    maybe_visualize_rollout_step_concat,
+)
 from ..video.checkpoint_video import make_video_for_checkpoint
+
+from tqdm import tqdm
+
+
+def _pad_first_time(x: torch.Tensor, T: int) -> torch.Tensor:
+    """x: (t, ...) -> (T, ...) by left-padding with first frame"""
+    t = int(x.shape[0])
+    if t == T:
+        return x
+    if t > T:
+        return x[-T:]
+    pad_len = T - t
+    pad = x[:1].expand(pad_len, *x.shape[1:]).contiguous()
+    return torch.cat([pad, x], dim=0)
 
 
 def train(cfg: TrainConfig, device=None):
     device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
     set_seed(int(cfg.env.base_seed))
 
-    seeder = EpisodeSeeder(cfg.env)
-    env = None
-    env, obs0, obs1 = reset_episode(env, cfg.env, seeder)
+    # ---- vectorized envs ----
+    num_envs = int(getattr(cfg.env, "num_envs", 1))
+    if num_envs < 1:
+        raise ValueError(f"env.num_envs must be >= 1, got {num_envs}")
 
-    h0 = ObsHistory(max_len=int(cfg.T))
-    h1 = ObsHistory(max_len=int(cfg.T))
-    h0.reset(obs0)
-    h1.reset(obs1)
+    seeder = EpisodeSeeder(cfg.env)
+
+    envs = []
+    obs0_list = []
+    obs1_list = []
+    h0_list = []
+    h1_list = []
+
+    for _ in range(num_envs):
+        env_i, o0, o1 = reset_episode(None, cfg.env, seeder)
+        envs.append(env_i)
+        obs0_list.append(o0)
+        obs1_list.append(o1)
+
+        h0 = ObsHistory(max_len=int(cfg.T))
+        h1 = ObsHistory(max_len=int(cfg.T))
+        h0.reset(o0)
+        h1.reset(o1)
+        h0_list.append(h0)
+        h1_list.append(h1)
 
     # ---- model selection via config ----
+    env0 = envs[0]
     policy = make_policy(
         cfg.model.name,
-        action_size=env.action_size,
-        H=env.H,
-        W=env.W,
+        action_size=env0.action_size,
+        H=env0.H,
+        W=env0.W,
         T=int(cfg.T),
         img_channels=20,
         meta_dim=10,
@@ -52,20 +90,16 @@ def train(cfg: TrainConfig, device=None):
         st_axial2d=cfg.model.st_axial2d,
     ).to(device)
     optimizer = optim.Adam(policy.parameters(), lr=float(cfg.lr))
+    mcts_policy = None
+    if getattr(cfg, 'mcts', None) is not None and bool(getattr(cfg.mcts, 'enabled', False)):
+        mcts_policy = AlphaZeroMCTSPolicy(policy, cfg.mcts, device=device, T=int(cfg.T))
+        print(f"[mcts] enabled: actor_mode={cfg.mcts.actor_mode}, sims={cfg.mcts.num_simulations}")
 
     opponent_pool = []
     ep_count = 0
-    win_count = 0
-    lose_count = 0
     start_update = 1
 
-    # ---- terminal-only (exclude truncated) averages ----
-
     def _terminal_stats_from_env(env_):
-        """
-        Use true env state (no fog): env_.env.*
-        Returns: (p0_army, p1_army, p0_land, p1_land, p0_cities, p1_cities)
-        """
         e = env_.env
         owner = e.owner
         army = e.army
@@ -107,9 +141,11 @@ def train(cfg: TrainConfig, device=None):
         if ck.get("rng_state") is not None:
             set_rng_state(ck["rng_state"])
 
-        env, obs0, obs1 = reset_episode(env, cfg.env, seeder)
-        h0.reset(obs0)
-        h1.reset(obs1)
+        for i in range(num_envs):
+            envs[i], obs0_list[i], obs1_list[i] = reset_episode(envs[i], cfg.env, seeder)
+            h0_list[i].reset(obs0_list[i])
+            h1_list[i].reset(obs1_list[i])
+
         print(f"[resume] loaded {cfg.resume_path} at update={ck['update']} pool={len(opponent_pool)}")
 
     os.makedirs(cfg.ckpt_dir, exist_ok=True)
@@ -130,20 +166,22 @@ def train(cfg: TrainConfig, device=None):
         term_sum_p1_land = 0
         term_sum_p0_cities = 0
         term_sum_p1_cities = 0
+        win_count = 0
+        lose_count = 0
 
         buf = RolloutBuffer(device=device)
 
-        # ---- viz ----
         do_viz = bool(cfg.viz.enable) and (upd % int(cfg.viz.every_updates) == 0)
         if do_viz and bool(cfg.viz.reset_episode_before_viz):
-            env, obs0, obs1 = reset_episode(env, cfg.env, seeder)
-            h0.reset(obs0)
-            h1.reset(obs1)
+            for i in range(num_envs):
+                envs[i], obs0_list[i], obs1_list[i] = reset_episode(envs[i], cfg.env, seeder)
+                h0_list[i].reset(obs0_list[i])
+                h1_list[i].reset(obs1_list[i])
 
         vs = viz_begin_update(
             do_viz=do_viz,
             out_dir=str(cfg.viz.out_dir),
-            frames_per_update=int(cfg.viz.frames_per_update),
+            frames_per_update=int(cfg.viz.frames_per_update),  # GLOBAL cap
             rollout_len=int(cfg.rollout_len),
             save_mp4=bool(cfg.viz.save_mp4),
             mp4_fps=int(cfg.viz.mp4_fps),
@@ -152,10 +190,11 @@ def train(cfg: TrainConfig, device=None):
             draw_text=bool(cfg.viz.draw_text),
             pov_player=int(cfg.viz.pov_player),
             upd=upd,
-            topk_actions=int(cfg.viz.topk_actions)
+            topk_actions=int(cfg.viz.topk_actions),
+            tag="",
         )
 
-        # ---- choose opponent for this update ----
+        # ---- choose opponent ----
         opp = None
         if len(opponent_pool) == 0:
             opp = policy if str(cfg.opponent.pool_empty_mode).lower() == "self" else None
@@ -165,110 +204,160 @@ def train(cfg: TrainConfig, device=None):
             else:
                 opp = policy if str(cfg.opponent.fallback_mode).lower() == "self" else None
 
-        # ---- rollout ----
-        for step in range(int(cfg.rollout_len)):
-            phi_s = phi_from_scores(obs0, cfg.reward_shaping.w_army, cfg.reward_shaping.w_land)
+        for step in tqdm(range(int(cfg.rollout_len)), desc=f"rollout upd {upd}", dynamic_ncols=True):
 
-            seq0 = h0.get_padded_seq() if cfg.seq_padding else h0.get_seq()
-            x_img0_seq, x_meta0_seq = encode_obs_sequence(seq0, player_id=0)
-            x_img0 = x_img0_seq.unsqueeze(0).to(device)
-            x_meta0 = x_meta0_seq.unsqueeze(0).to(device)
+            phi_s_list = [
+                phi_from_scores(obs0_list[i], cfg.reward_shaping.w_army, cfg.reward_shaping.w_land)
+                for i in range(num_envs)
+            ]
 
-            mask0_np = env.legal_action_mask(Owner.P0)
-            mask0 = torch.from_numpy(mask0_np).unsqueeze(0).to(device).to(torch.bool)
+            x_img_seq_list = []
+            x_meta_seq_list = []
+            mask0_t_list = []
+            T_lens = []
 
-            a0, logp0, v0, _ = policy.act(x_img0, x_meta0, mask0)
+            for i in range(num_envs):
+                seq0 = h0_list[i].get_padded_seq() if cfg.seq_padding else h0_list[i].get_seq()
+                x_img_seq_i, x_meta_seq_i = encode_obs_sequence(seq0, player_id=0)
+                x_img_seq_list.append(x_img_seq_i)
+                x_meta_seq_list.append(x_meta_seq_i)
+                T_lens.append(int(x_img_seq_i.shape[0]))
 
-            a1 = choose_opponent_action(
-                env,
+                mask_np = envs[i].legal_action_mask(Owner.P0)
+                mask0_t_list.append(torch.from_numpy(mask_np).to(torch.bool))
+
+            T_step = max(T_lens)
+            x_img_step = torch.stack([_pad_first_time(x, T_step) for x in x_img_seq_list], dim=0)
+            x_meta_step = torch.stack([_pad_first_time(x, T_step) for x in x_meta_seq_list], dim=0)
+            mask0_step = torch.stack(mask0_t_list, dim=0)
+
+            x_img0 = x_img_step.to(device)
+            x_meta0 = x_meta_step.to(device)
+            mask0 = mask0_step.to(device)
+            if mcts_policy is not None and str(getattr(cfg.mcts, 'actor_mode', 'ppo')).lower() == 'mcts':
+                # MCTS action selection (per-env, sequential)
+                a0_list = []
+                for i in range(len(envs)):
+                    a_i, _ = mcts_policy.select_action(envs[i], h0_list[i], h1_list[i], player=Owner.P0)
+                    a0_list.append(int(a_i))
+                a0 = torch.tensor(a0_list, device=device, dtype=torch.long)
+                logp0, _, v0 = policy.evaluate_actions(x_img0, x_meta0, mask0, a0)
+            else:
+                a0, logp0, v0, _ = policy.act(x_img0, x_meta0, mask0)
+
+            a1_list = choose_opponent_action_batched(
+                envs,
                 opp,
-                h1,
+                h1_list,
                 device=device,
                 random_prob=float(cfg.opponent.random_opp_prob),
                 T=int(cfg.T),
+                seq_padding=bool(cfg.seq_padding),
             )
 
-            res = env.step(int(a0.item()), int(a1))
-            obs0_next, obs1_next = res.obs
-            done = bool(res.terminated or res.truncated)
+            r_list: List[float] = []
+            done_list: List[bool] = []
+            a0_list_int: List[int] = []
+            a1_list_int: List[int] = []
+            v_list_float: List[float] = []
+            logp_list_float: List[float] = []
 
-            phi_sp = phi_from_scores(obs0_next, cfg.reward_shaping.w_army, cfg.reward_shaping.w_land)
-            env_r0, _ = res.reward
-            r = potential_shaped_reward(env_r0, phi_s, phi_sp, gamma=float(cfg.gamma), done=done)
+            for i in range(num_envs):
+                a0_i = int(a0[i].item())
+                a1_i = int(a1_list[i])
 
-            buf.add(
-                x_img_seq=x_img0_seq,
-                x_meta_seq=x_meta0_seq,
-                maskA=torch.from_numpy(mask0_np).to(torch.bool),
-                a=a0.cpu(),
-                logp=logp0.cpu(),
-                v=v0.cpu(),
-                r=r,
-                done=done,
+                res = envs[i].step(a0_i, a1_i)
+                obs0_next, obs1_next = res.obs
+                done = bool(res.terminated or res.truncated)
+
+                phi_sp = phi_from_scores(obs0_next, cfg.reward_shaping.w_army, cfg.reward_shaping.w_land)
+                env_r0, _ = res.reward
+                r = potential_shaped_reward(env_r0, phi_s_list[i], phi_sp, gamma=float(cfg.gamma), done=done)
+
+                r_list.append(float(r))
+                done_list.append(done)
+                a0_list_int.append(a0_i)
+                a1_list_int.append(a1_i)
+                v_list_float.append(float(v0[i].item()))
+                logp_list_float.append(float(logp0[i].item()))
+
+                obs0_list[i], obs1_list[i] = obs0_next, obs1_next
+                h0_list[i].push(obs0_next)
+                h1_list[i].push(obs1_next)
+
+                if done:
+                    ep_count += 1
+
+                    if res.terminated:
+                        if res.info.get("winner", None) == int(Owner.P0):
+                            win_count += 1
+                        if res.info.get("winner", None) == int(Owner.P1):
+                            lose_count += 1
+
+                    if res.terminated or res.truncated:
+                        p0a, p1a, p0l, p1l, p0c, p1c = _terminal_stats_from_env(envs[i])
+                        term_n += 1
+                        term_sum_p0_army += p0a
+                        term_sum_p1_army += p1a
+                        term_sum_p0_land += p0l
+                        term_sum_p1_land += p1l
+                        term_sum_p0_cities += p0c
+                        term_sum_p1_cities += p1c
+
+                    envs[i], obs0_list[i], obs1_list[i] = reset_episode(envs[i], cfg.env, seeder)
+                    h0_list[i].reset(obs0_list[i])
+                    h1_list[i].reset(obs1_list[i])
+
+            buf.add_step(
+                x_img_seq=x_img_step,
+                x_meta_seq=x_meta_step,
+                maskA=mask0_step,
+                a=a0.detach().cpu(),
+                logp=logp0.detach().cpu(),
+                v=v0.detach().cpu(),
+                r=torch.tensor(r_list, dtype=torch.float32),
+                done=torch.tensor([1.0 if d else 0.0 for d in done_list], dtype=torch.float32),
             )
 
-            maybe_visualize_rollout_step(
-                vs,
-                env,
-                upd,
-                step,
-                a0=int(a0.item()),
-                a1=int(a1),
-                r=float(r),
-                v=float(v0.item()),
-                logp=float(logp0.item()),
-                done=done,
-                policy=policy,
-                x_img=x_img0,          # (1,T,C,H,W)
-                x_meta=x_meta0,        # (1,T,M)
-                legal_mask=mask0,      # (1,A) bool
-            )
+            if do_viz:
+                maybe_visualize_rollout_step_concat(
+                    vs,
+                    envs=envs,
+                    upd=upd,
+                    step=step,
+                    a0_list=a0_list_int,
+                    a1_list=a1_list_int,
+                    r_list=r_list,
+                    v_list=v_list_float,
+                    logp_list=logp_list_float,
+                    done_list=done_list,
+                    policy=policy,
+                    x_img_batch=x_img0,
+                    x_meta_batch=x_meta0,
+                    legal_mask_batch=mask0,
+                )
 
+        viz_end_update(vs, upd, tag="")
 
-            obs0, obs1 = obs0_next, obs1_next
-            h0.push(obs0)
-            h1.push(obs1)
+        # ---- bootstrap V(s_T) ----
+        x_img_seq_list = []
+        x_meta_seq_list = []
+        T_lens = []
+        for i in range(num_envs):
+            seq0 = h0_list[i].get_padded_seq() if cfg.seq_padding else h0_list[i].get_seq()
+            x_img_seq_i, x_meta_seq_i = encode_obs_sequence(seq0, player_id=0)
+            x_img_seq_list.append(x_img_seq_i)
+            x_meta_seq_list.append(x_meta_seq_i)
+            T_lens.append(int(x_img_seq_i.shape[0]))
 
-            if done:
-                ep_count += 1
+        T_step = max(T_lens)
+        x_img_last = torch.stack([_pad_first_time(x, T_step) for x in x_img_seq_list], dim=0).to(device)
+        x_meta_last = torch.stack([_pad_first_time(x, T_step) for x in x_meta_seq_list], dim=0).to(device)
 
-                # win count (only meaningful on terminated)
-                if res.terminated:
-                    if res.info.get("winner", None) == int(Owner.P0):
-                        win_count += 1
-                    else:
-                        lose_count += 1
+        with torch.no_grad():
+            _, v_last = policy.logits_and_value(x_img_last, x_meta_last)
 
-                # ✅ terminal-only stats (exclude truncated episodes)
-                if res.terminated or res.truncated:
-                    p0a, p1a, p0l, p1l, p0c, p1c = _terminal_stats_from_env(env)
-                    term_n += 1
-                    term_sum_p0_army += p0a
-                    term_sum_p1_army += p1a
-                    term_sum_p0_land += p0l
-                    term_sum_p1_land += p1l
-                    term_sum_p0_cities += p0c
-                    term_sum_p1_cities += p1c
-
-                env, obs0, obs1 = reset_episode(env, cfg.env, seeder)
-                h0.reset(obs0)
-                h1.reset(obs1)
-
-        viz_end_update(vs, upd)
-
-        # ---- bootstrap V(s_T) if rollout ended mid-episode ----
-        last_done = bool(buf.done[-1] > 0.5) if len(buf.done) > 0 else True
-        if last_done:
-            last_v = 0.0
-        else:
-            seq0 = h0.get_padded_seq() if cfg.seq_padding else h0.get_seq()
-            x_img0_seq, x_meta0_seq = encode_obs_sequence(seq0, player_id=0)
-            x_img0 = x_img0_seq.unsqueeze(0).to(device)
-            x_meta0 = x_meta0_seq.unsqueeze(0).to(device)
-            mask0_np = env.legal_action_mask(Owner.P0)
-            mask0 = torch.from_numpy(mask0_np).unsqueeze(0).to(device).to(torch.bool)
-            _, _, v_last, _ = policy.act(x_img0, x_meta0, mask0)
-            last_v = float(v_last.item())
+        last_v = v_last.detach().to(device).view(-1)
 
         batch = buf.build(gamma=float(cfg.gamma), lam=float(cfg.lam), last_v=last_v)
         ppo_update(policy, optimizer, batch, cfg=cfg.ppo, device=device)
@@ -332,9 +421,9 @@ def train(cfg: TrainConfig, device=None):
 
         # ---- logging ----
         if int(cfg.log_every) > 0 and upd % int(cfg.log_every) == 0:
-            wr = win_count / max(1, ep_count)
-            lr = lose_count / max(1, ep_count)
-            msg = f"[upd {upd:4d}] episodes={ep_count:6d} win_rate={wr:.3f} lose_rate={lr:.3f} pool={len(opponent_pool)}"
+            win_rate = win_count / max(1, term_n)
+            lose_rate = lose_count / max(1, term_n)
+            msg = f"[upd {upd:4d}] episodes={ep_count:6d} win_rate={win_rate:.3f} lose_rate={lose_rate:.3f} pool={len(opponent_pool)}"
 
             if term_n > 0:
                 avg_p0_army = term_sum_p0_army / term_n

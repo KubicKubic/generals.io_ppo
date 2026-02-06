@@ -13,6 +13,9 @@
 #  - HARD constraints:
 #       * Manhattan distance between the two generals >= min_general_dist
 #       * The two generals must be connected via passable land (non-mountain tiles)
+#
+# CHANGE: real area is embedded with a RANDOM OFFSET (real_r0, real_c0),
+#         instead of always starting at (0,0).
 
 from __future__ import annotations
 
@@ -105,7 +108,10 @@ class GeneralsEnv:
 
     Fixed grid is self.H x self.W (defaults 25x25).
     Each reset samples a "real" map size (real_H, real_W) uniformly from [min_real_size..max_real_size],
-    and fills outside [0:real_H, 0:real_W] with mountains.
+    and fills outside real area with mountains.
+
+    CHANGE: real area is embedded with a RANDOM OFFSET (real_r0, real_c0).
+    So the real window is [real_r0:real_r0+real_H, real_c0:real_c0+real_W].
 
     State tensors (H, W):
       - tile_type: TileType (EMPTY/MOUNTAIN/CITY/GENERAL)
@@ -123,6 +129,7 @@ class GeneralsEnv:
       - turn: turn index as array([turn])
       - half_in_turn: array([0 or 1])
       - real_shape: array([real_H, real_W])
+      - (optional) real_offset: array([real_r0, real_c0])  # added, but does not remove anything else
 
     Map generation knobs (init-time adjustable):
       - mountain_ratio_low/high: ratio range for internal mountains (on real area), inclusive-ish
@@ -150,14 +157,14 @@ class GeneralsEnv:
         # max_real_size: int = 25,
         # min_general_dist: int = 15,
         min_real_size: int = 5,
-        max_real_size: int = 8,
-        min_general_dist: int = 6,
+        max_real_size: int = 6,
+        min_general_dist: int = 5,
 
         # map distribution knobs (NEW)
         mountain_ratio_low: float = 1.0 / 8.0,
         mountain_ratio_high: float = 1.0 / 4.0,
-        city_count_low: int = 4,
-        city_count_high: int = 10,
+        city_count_low: int = 0,
+        city_count_high: int = 1,
 
         # action-space constraint
         forbid_mode1: bool = False,
@@ -214,6 +221,10 @@ class GeneralsEnv:
         self.real_H = self.H
         self.real_W = self.W
 
+        # NEW: real map offset (top-left corner) for current episode
+        self.real_r0 = 0
+        self.real_c0 = 0
+
         # time
         self.half_t = 0  # each step() increments by 1
         self.t = 0       # kept for compatibility; equals half_t
@@ -231,7 +242,12 @@ class GeneralsEnv:
 
         obs0 = self._make_obs(Owner.P0)
         obs1 = self._make_obs(Owner.P1)
-        return (obs0, obs1), {"half_t": self.half_t, "turn": self.half_t // 2, "real_shape": (self.real_H, self.real_W)}
+        return (obs0, obs1), {
+            "half_t": self.half_t,
+            "turn": self.half_t // 2,
+            "real_shape": (self.real_H, self.real_W),
+            "real_offset": (self.real_r0, self.real_c0),
+        }
 
     def step(self, action0: int, action1: int) -> StepResult:
         """
@@ -271,6 +287,7 @@ class GeneralsEnv:
             "half_in_turn": self.half_t % 2,
             "winner": int(winner) if winner is not None else None,
             "real_shape": (self.real_H, self.real_W),
+            "real_offset": (self.real_r0, self.real_c0),
         }
         return StepResult((obs0, obs1), (r0, r1), term, truncated, info)
 
@@ -309,6 +326,11 @@ class GeneralsEnv:
         if not mask.any():
             mask[0] = True
         return mask
+    def clone(self):
+        """Deep-copy the env (for MCTS)."""
+        import copy as _copy
+        return _copy.deepcopy(self)
+
 
     # -----------------------------
     # Map generation
@@ -316,10 +338,11 @@ class GeneralsEnv:
 
     def _generate_map(self):
         """
-        Map generation (real area only, excluding the padded mountains outside real_H/real_W):
+        Map generation (real area only, excluding the padded mountains outside real window):
 
           - real_H, real_W sampled uniformly from [min_real_size, max_real_size]
-          - outside real area filled with mountains
+          - NEW: real window top-left (real_r0, real_c0) sampled uniformly so it fits in HxW
+          - outside real window filled with mountains
           - place 2 generals on EMPTY tiles with Manhattan distance >= min_general_dist
           - sample:
                 * mountain ratio in [mountain_ratio_low, mountain_ratio_high]
@@ -337,6 +360,10 @@ class GeneralsEnv:
         # Sample real dimensions uniformly
         self.real_H = int(self.rng.integers(self.min_real_size, self.max_real_size + 1))
         self.real_W = int(self.rng.integers(self.min_real_size, self.max_real_size + 1))
+
+        # NEW: random offset for embedding the real map
+        self.real_r0 = int(self.rng.integers(0, self.H - self.real_H + 1))
+        self.real_c0 = int(self.rng.integers(0, self.W - self.real_W + 1))
 
         area = self.real_H * self.real_W
 
@@ -368,16 +395,17 @@ class GeneralsEnv:
 
     def _init_base_with_padding(self):
         """
-        Set outside [0:real_H,0:real_W] to mountains.
-        Inside real area, start with empty neutral land.
+        Set outside real window to mountains.
+        Inside real window, start with empty neutral land.
         """
         # default everything to mountain
         self.tile_type.fill(TileType.MOUNTAIN)
         self.owner.fill(Owner.NEUTRAL)
         self.army.fill(0)
 
-        # carve real area as empty
-        self.tile_type[: self.real_H, : self.real_W] = TileType.EMPTY
+        # carve real window as empty
+        r0, c0 = self.real_r0, self.real_c0
+        self.tile_type[r0: r0 + self.real_H, c0: c0 + self.real_W] = TileType.EMPTY
 
         # clear general positions
         self.general_pos[Owner.P0] = None
@@ -386,7 +414,7 @@ class GeneralsEnv:
     def _generals_connected_via_empty(self) -> bool:
         """
         Check if the two generals are connected via EMPTY land (plus endpoints on GENERAL),
-        within the real area. That is, we allow traversal on tiles whose tile_type is
+        within the real window. That is, we allow traversal on tiles whose tile_type is
         EMPTY or GENERAL only.
         """
         g0 = self.general_pos[Owner.P0]
@@ -397,8 +425,14 @@ class GeneralsEnv:
         (sr, sc) = g0
         (tr, tc) = g1
 
-        sub = self.tile_type[: self.real_H, : self.real_W]
-        passable = (sub == TileType.EMPTY) | (sub == TileType.GENERAL)
+        r0, c0 = self.real_r0, self.real_c0
+        r1, c1 = r0 + self.real_H, c0 + self.real_W  # exclusive bounds
+
+        # ensure endpoints inside the real window
+        if not (r0 <= sr < r1 and c0 <= sc < c1 and r0 <= tr < r1 and c0 <= tc < c1):
+            return False
+
+        passable = (self.tile_type == TileType.EMPTY) | (self.tile_type == TileType.GENERAL)
 
         if not passable[sr, sc] or not passable[tr, tc]:
             return False
@@ -408,7 +442,7 @@ class GeneralsEnv:
         head = 0
         tail = 0
 
-        visited = np.zeros((self.real_H, self.real_W), dtype=np.bool_)
+        visited = np.zeros((self.H, self.W), dtype=np.bool_)
         visited[sr, sc] = True
         q_r[tail] = sr
         q_c[tail] = sc
@@ -422,23 +456,23 @@ class GeneralsEnv:
             if (r, c) == (tr, tc):
                 return True
 
-            # 4-neighbors
-            if r > 0 and (not visited[r - 1, c]) and passable[r - 1, c]:
+            # 4-neighbors within window bounds
+            if r - 1 >= r0 and (not visited[r - 1, c]) and passable[r - 1, c]:
                 visited[r - 1, c] = True
                 q_r[tail] = r - 1
                 q_c[tail] = c
                 tail += 1
-            if r + 1 < self.real_H and (not visited[r + 1, c]) and passable[r + 1, c]:
+            if r + 1 < r1 and (not visited[r + 1, c]) and passable[r + 1, c]:
                 visited[r + 1, c] = True
                 q_r[tail] = r + 1
                 q_c[tail] = c
                 tail += 1
-            if c > 0 and (not visited[r, c - 1]) and passable[r, c - 1]:
+            if c - 1 >= c0 and (not visited[r, c - 1]) and passable[r, c - 1]:
                 visited[r, c - 1] = True
                 q_r[tail] = r
                 q_c[tail] = c - 1
                 tail += 1
-            if c + 1 < self.real_W and (not visited[r, c + 1]) and passable[r, c + 1]:
+            if c + 1 < c1 and (not visited[r, c + 1]) and passable[r, c + 1]:
                 visited[r, c + 1] = True
                 q_r[tail] = r
                 q_c[tail] = c + 1
@@ -469,13 +503,13 @@ class GeneralsEnv:
     def _place_one_conditional(self, new_type: TileType) -> bool:
         """
         Attempt to place one tile of type new_type (MOUNTAIN or CITY) by random sampling
-        over EMPTY tiles in the real area, keeping generals connected via EMPTY land.
+        over EMPTY tiles in the real window, keeping generals connected via EMPTY land.
         """
         # How many random trials for this single placement before giving up.
-        # Real area is at most 25*25=625, so this is cheap.
         for _trial in range(20000):
-            r = int(self.rng.integers(0, self.real_H))
-            c = int(self.rng.integers(0, self.real_W))
+            r0, c0 = self.real_r0, self.real_c0
+            r = int(self.rng.integers(r0, r0 + self.real_H))
+            c = int(self.rng.integers(c0, c0 + self.real_W))
             if self.tile_type[r, c] != TileType.EMPTY:
                 continue
 
@@ -506,11 +540,12 @@ class GeneralsEnv:
 
     def _random_empty_in_real(self) -> Tuple[int, int]:
         """
-        Pick a cell in real area whose tile_type is EMPTY.
+        Pick a cell in real window whose tile_type is EMPTY.
         """
         for _ in range(20000):
-            r = int(self.rng.integers(0, self.real_H))
-            c = int(self.rng.integers(0, self.real_W))
+            r0, c0 = self.real_r0, self.real_c0
+            r = int(self.rng.integers(r0, r0 + self.real_H))
+            c = int(self.rng.integers(c0, c0 + self.real_W))
             if self.tile_type[r, c] == TileType.EMPTY:
                 return r, c
         raise RuntimeError("No empty cell found in real area (too many mountains).")
@@ -524,7 +559,7 @@ class GeneralsEnv:
 
     def _place_generals_with_constraints(self) -> bool:
         """
-        Place two generals in the real area:
+        Place two generals in the real window:
           - only on EMPTY cells
           - Manhattan distance >= min_general_dist (hard)
         """
@@ -560,6 +595,8 @@ class GeneralsEnv:
         """
         Place neutral cities in the real area on EMPTY cells.
         Each city initial army sampled uniformly from [city_initial_low, city_initial_high].
+
+        (Interface preserved; updated to respect real_offset.)
         """
         area = self.real_H * self.real_W
         n_c = max(2, area // 50)
@@ -568,8 +605,9 @@ class GeneralsEnv:
         for _ in range(20000):
             if placed >= n_c:
                 break
-            r = int(self.rng.integers(0, self.real_H))
-            c = int(self.rng.integers(0, self.real_W))
+            r0, c0 = self.real_r0, self.real_c0
+            r = int(self.rng.integers(r0, r0 + self.real_H))
+            c = int(self.rng.integers(c0, c0 + self.real_W))
             if self.tile_type[r, c] != TileType.EMPTY:
                 continue
             # Place city
@@ -656,6 +694,9 @@ class GeneralsEnv:
 
             # map size info (you already added)
             "real_shape": np.array([self.real_H, self.real_W], dtype=np.int32),
+
+            # NEW (doesn't remove any old key): offset info for debugging/agents
+            "real_offset": np.array([self.real_r0, self.real_c0], dtype=np.int32),
         }
 
     # -----------------------------
@@ -868,14 +909,19 @@ class GeneralsEnv:
 if __name__ == "__main__":
     env = GeneralsEnv(seed=0)
     (o0, o1), info = env.reset()
-    print("reset:", info, "real_shape:", o0["real_shape"])
+    print("reset:", info, "real_shape:", o0["real_shape"], "real_offset:", o0.get("real_offset", None))
     for i in range(20):
         a0 = int(np.random.randint(env.action_size))
         a1 = int(np.random.randint(env.action_size))
         res = env.step(a0, a1)
         if i < 5:
             # show a small slice of tile_type obs for p0
-            print("half_t:", res.info["half_t"], "turn:", res.info["turn"], "real_shape:", res.info["real_shape"])
+            print(
+                "half_t:", res.info["half_t"],
+                "turn:", res.info["turn"],
+                "real_shape:", res.info["real_shape"],
+                "real_offset:", res.info.get("real_offset", None),
+            )
         if res.terminated or res.truncated:
             print("done:", res.info)
             break

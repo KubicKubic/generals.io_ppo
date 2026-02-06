@@ -2,18 +2,28 @@ from __future__ import annotations
 
 import os
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Optional, TextIO, List, Tuple
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 
-import imageio.v2 as imageio
-from PIL import Image, ImageDraw, ImageFont
+try:
+    import imageio.v2 as imageio
+except Exception:
+    imageio = None
+
+try:
+    from PIL import Image, ImageDraw, ImageFont
+except Exception:
+    Image = None
+    ImageDraw = None
+    ImageFont = None
 
 from ..env.generals_env import Owner, TileType
 from ..env.generals_env_memory import GeneralsEnvWithMemory
+
 
 # ----------------------------
 # Viz state
@@ -22,19 +32,23 @@ from ..env.generals_env_memory import GeneralsEnvWithMemory
 class VizState:
     do_viz: bool
     out_dir: str
-    frames_per_update: int
+    frames_per_update: int   # NOW: global cap for the whole mp4
     stride: int
-    saved: int
+    saved: int               # number of frames actually written (or planned)
     writer: Any
     trace_f: Optional[TextIO]
     cell: int
     draw_text: bool
     pov_player: int
 
-    # NEW: top-k action viz
+    # top-k action viz (optional)
     topk_actions: int
     draw_arrows: bool
     print_topk: bool
+
+    # concat buffer: frame_buf[env_id] = [frame0, frame1, ...]
+    frame_buf: List[List[np.ndarray]] = field(default_factory=list)
+
 
 # ---------- rendering helpers ----------
 def _clamp(x, lo, hi):
@@ -61,7 +75,6 @@ C_GENERAL_TINT = (240, 210, 80)
 
 # ---------- robust enum helpers ----------
 def _enum_payload(e):
-    """Return candidate representations for enum-like object e."""
     outs = [e]
     v = getattr(e, "value", None)
     if v is not None:
@@ -78,32 +91,7 @@ def _enum_payload(e):
     return outs
 
 
-def _eq_enumish(x, const) -> bool:
-    """Robust equality: expand payload for BOTH sides and compare."""
-    xs = _enum_payload(x)
-    cs = _enum_payload(const)
-
-    for a in xs:
-        for b in cs:
-            try:
-                if a == b:
-                    return True
-            except Exception:
-                pass
-
-    for a in xs:
-        for b in cs:
-            try:
-                if int(a) == int(b):
-                    return True
-            except Exception:
-                pass
-
-    return False
-
-
 def _to_int_enumish(x, fallback: int = 0) -> int:
-    """Best-effort convert enum-ish / numpy scalar / int to int."""
     for a in _enum_payload(x):
         try:
             return int(a)
@@ -117,46 +105,12 @@ def render_full_frame(
     cell: int = 20,
     draw_text: bool = True,
     pov_player: int = 0,
-    hud_height: int = 14,     # top padding height
-    draw_hud: bool = True,    # set False to disable HUD entirely
+    hud_height: int = 14,
+    draw_hud: bool = True,
 ) -> np.ndarray:
-    """
-    Render full true state.
-
-    Fixes:
-      - "black background + white numbers" (numpy/PIL desync) by drawing tiles/grid in numpy first,
-        then converting to PIL to draw text/HUD.
-      - HUD covering the board by adding TOP PADDING (hud_height) and shifting the board down.
-    """
     env = env_mem.env
     H, W = env.H, env.W
 
-    # ---------- robust enum/int helpers ----------
-    def _enum_payload(e):
-        outs = [e]
-        v = getattr(e, "value", None)
-        if v is not None:
-            outs.append(v)
-        try:
-            outs.append(int(e))
-        except Exception:
-            pass
-        if v is not None:
-            try:
-                outs.append(int(v))
-            except Exception:
-                pass
-        return outs
-
-    def _to_int_enumish(x, fallback: int = 0) -> int:
-        for a in _enum_payload(x):
-            try:
-                return int(a)
-            except Exception:
-                pass
-        return int(fallback)
-
-    # robust constants
     O_NEU = _to_int_enumish(Owner.NEUTRAL)
     O_P0  = _to_int_enumish(Owner.P0)
     O_P1  = _to_int_enumish(Owner.P1)
@@ -177,10 +131,8 @@ def render_full_frame(
             return C_ENEMY
         return C_NEUTRAL
 
-    # ---------- top padding ----------
     pad_top = hud_height if (draw_text and draw_hud) else 0
 
-    # ---------- Phase 1: draw tiles + grid into numpy ----------
     img = np.zeros((pad_top + H * cell, W * cell, 3), dtype=np.uint8)
     img[:] = C_BG
 
@@ -204,15 +156,12 @@ def render_full_frame(
             x0 = c * cell
             img[y0:y0 + cell, x0:x0 + cell] = col
 
-            # grid
             img[y0:y0 + 1, x0:x0 + cell] = C_GRID
             img[y0:y0 + cell, x0:x0 + 1] = C_GRID
 
-    # outer border for the board area only
     img[pad_top + H * cell - 1: pad_top + H * cell, :, :] = C_GRID
     img[pad_top: pad_top + H * cell, W * cell - 1: W * cell, :] = C_GRID
 
-    # ---------- Phase 2: draw numbers + HUD on PIL ----------
     if draw_text and Image is not None and ImageDraw is not None and ImageFont is not None:
         try:
             font = ImageFont.load_default()
@@ -223,7 +172,6 @@ def render_full_frame(
             pil_img = Image.fromarray(img)
             draw = ImageDraw.Draw(pil_img)
 
-            # numbers
             for r in range(H):
                 for c in range(W):
                     t = _to_int_enumish(env.tile_type[r, c])
@@ -247,12 +195,10 @@ def render_full_frame(
 
                     draw.text((x0 + 2, y0 + 1), str(a), fill=tc, font=font)
 
-            # HUD in top padding area
             if draw_hud and pad_top > 0:
                 turn = env.half_t // 2
                 half_in_turn = env.half_t % 2
 
-                # robust scan for army/land
                 flat_owner = env.owner.reshape(-1).tolist()
                 flat_army = env.army.reshape(-1).tolist()
                 army0 = army1 = land0 = land1 = 0
@@ -269,7 +215,6 @@ def render_full_frame(
                     f"half_t={env.half_t}  turn={turn}  half={half_in_turn} | "
                     f"P0 army/land={army0}/{land0}  P1 army/land={army1}/{land1}"
                 )
-                # background bar (only in padding, not on board)
                 draw.rectangle((0, 0, min(W * cell, 980), pad_top), fill=(0, 0, 0))
                 draw.text((3, 0), hud, fill=(255, 255, 255), font=font)
 
@@ -291,13 +236,28 @@ def viz_begin_update(
     draw_text: bool,
     pov_player: int,
     upd: int,
-    # NEW:
     topk_actions: int = 10,
     draw_arrows: bool = True,
     print_topk: bool = False,
+    tag: str = "",
 ) -> VizState:
     if not do_viz:
-        return VizState(False, out_dir, frames_per_update, 10**9, 0, None, None, cell, draw_text, pov_player, topk_actions, draw_arrows, print_topk)
+        return VizState(
+            False,
+            out_dir,
+            int(frames_per_update),
+            10**9,
+            0,
+            None,
+            None,
+            cell,
+            draw_text,
+            pov_player,
+            topk_actions,
+            draw_arrows,
+            print_topk,
+            frame_buf=[],
+        )
 
     if imageio is None:
         raise RuntimeError("Visualization requires imageio. pip install imageio imageio-ffmpeg")
@@ -305,33 +265,75 @@ def viz_begin_update(
     os.makedirs(out_dir, exist_ok=True)
     stride = 1
 
+    suffix = f"_{tag}" if tag else ""
     writer = None
     if save_mp4:
-        mp4_path = os.path.join(out_dir, f"upd_{upd:06d}.mp4")
-        writer = imageio.get_writer(mp4_path, fps=int(mp4_fps), codec="libx264", quality=8)
+        mp4_path = os.path.join(out_dir, f"upd_{upd:06d}{suffix}.mp4")
+        writer = imageio.get_writer(
+            mp4_path,
+            fps=int(mp4_fps),
+            codec="libx264",
+            quality=8,
+            ffmpeg_log_level="error",
+            macro_block_size=None,
+        )
 
     trace_f = None
     if save_trace_jsonl:
-        trace_path = os.path.join(out_dir, f"upd_{upd:06d}.jsonl")
+        trace_path = os.path.join(out_dir, f"upd_{upd:06d}{suffix}.jsonl")
         trace_f = open(trace_path, "w", encoding="utf-8")
 
-    return VizState(True, out_dir, frames_per_update, stride, 0, writer, trace_f, cell, draw_text, pov_player, topk_actions, draw_arrows, print_topk)
+    return VizState(
+        True,
+        out_dir,
+        int(frames_per_update),  # global cap
+        stride,
+        0,
+        writer,
+        trace_f,
+        cell,
+        draw_text,
+        pov_player,
+        topk_actions,
+        draw_arrows,
+        print_topk,
+        frame_buf=[],
+    )
 
 
-def viz_end_update(vs: VizState, upd: int):
+def viz_end_update(vs: VizState, upd: int, tag: str = ""):
     if not vs.do_viz:
         return
+
+    suffix = f"_{tag}" if tag else ""
+
+    written = 0
+    cap = int(vs.frames_per_update)
+
+    # IMPORTANT: write at most `cap` frames TOTAL, in env_id order.
+    if vs.writer is not None and vs.frame_buf:
+        for env_id in range(len(vs.frame_buf)):
+            if written >= cap:
+                break
+            for fr in vs.frame_buf[env_id]:
+                if written >= cap:
+                    break
+                vs.writer.append_data(fr)
+                written += 1
+
+    vs.saved = written
+
     if vs.writer is not None:
         vs.writer.close()
-        print(f"[viz] saved mp4: {os.path.join(vs.out_dir, f'upd_{upd:06d}.mp4')}")
+        print(f"[viz] saved mp4: {os.path.join(vs.out_dir, f'upd_{upd:06d}{suffix}.mp4')}")
     if vs.trace_f is not None:
         vs.trace_f.close()
-        print(f"[viz] saved trace: {os.path.join(vs.out_dir, f'upd_{upd:06d}.jsonl')}")
-    print(f"[viz] saved {vs.saved} frames to {vs.out_dir} for upd={upd}")
+        print(f"[viz] saved trace: {os.path.join(vs.out_dir, f'upd_{upd:06d}{suffix}.jsonl')}")
+    print(f"[viz] saved {vs.saved} frames (cap={cap}) to {vs.out_dir} for upd={upd}{suffix}")
 
 
 # ----------------------------
-# Helpers: decode/arrow draw
+# Optional: arrows/top-k
 # ----------------------------
 def _decode_action_flat(a: int) -> Tuple[int, int, int]:
     src = a // 8
@@ -342,7 +344,6 @@ def _decode_action_flat(a: int) -> Tuple[int, int, int]:
 
 
 def _dir_to_delta(d: int) -> Tuple[int, int]:
-    # 约定：0=up,1=right,2=down,3=left（若你 env 不同可在这里改）
     if d == 0:
         return -1, 0
     if d == 1:
@@ -350,6 +351,7 @@ def _dir_to_delta(d: int) -> Tuple[int, int]:
     if d == 2:
         return 1, 0
     return 0, -1
+
 
 def _draw_arrows_on_frame(
     frame: np.ndarray,
@@ -360,10 +362,6 @@ def _draw_arrows_on_frame(
     probs: List[float],
     hud_height_guess: int = 14,
 ) -> np.ndarray:
-    """
-    Draw arrows for top actions using green shades (dark->light),
-    and draw legend OUTSIDE the board (right margin).
-    """
     if Image is None or ImageDraw is None:
         return frame
 
@@ -372,15 +370,8 @@ def _draw_arrows_on_frame(
 
     pad_top = hud_height_guess if (frame.shape[0] >= H * cell + hud_height_guess) else 0
 
-    # ---------- arrow style ----------
-    # smaller arrows than before
     def rank_color(i: int, n: int) -> tuple[int, int, int]:
-        # i: 0..n-1, 0 is best (darkest)
-        if n <= 1:
-            t = 0.0
-        else:
-            t = i / (n - 1)  # 0..1
-        # dark green -> light green
+        t = 0.0 if n <= 1 else i / (n - 1)
         dark = (0, 140, 0)
         light = (180, 255, 180)
         r = int(dark[0] * (1 - t) + light[0] * t)
@@ -388,12 +379,10 @@ def _draw_arrows_on_frame(
         b = int(dark[2] * (1 - t) + light[2] * t)
         return (r, g, b)
 
-    # arrow head parameters (smaller)
     head_len = 6
     head_w = 4
     shrink = 0.70
 
-    # ---------- draw arrows on board ----------
     for i, (a, p) in enumerate(zip(actions, probs)):
         src, d, m = _decode_action_flat(int(a))
         r = src // W
@@ -407,7 +396,6 @@ def _draw_arrows_on_frame(
         x2 = c2 * cell + cell // 2
         y2 = pad_top + r2 * cell + cell // 2
 
-        # shorten body
         x2s = int(x1 + (x2 - x1) * shrink)
         y2s = int(y1 + (y2 - y1) * shrink)
 
@@ -416,7 +404,6 @@ def _draw_arrows_on_frame(
 
         draw_base.line((x1, y1, x2s, y2s), fill=col, width=width)
 
-        # arrow head
         hx = x2s - x1
         hy = y2s - y1
         L = (hx * hx + hy * hy) ** 0.5 + 1e-6
@@ -433,178 +420,47 @@ def _draw_arrows_on_frame(
         draw_base.line((x2s, y2s, bx, by), fill=col, width=width)
         draw_base.line((x2s, y2s, cx, cy), fill=col, width=width)
 
-    # ---------- legend outside (right margin, auto columns) ----------
-    out_h = base.size[1]
+    return np.asarray(base)
 
-    # layout params
-    title_h = 18          # title text block height
-    line_h = 14           # one entry line height
-    sw = 10               # color swatch size
-    left_pad = 8
-    top_pad = 8
-    col_gap = 14          # gap between legend columns
 
-    # how many entries fit per column?
-    usable_h = out_h - (top_pad + title_h + 6)
-    lines_per_col = max(1, usable_h // line_h)
-
-    # a safe column width (no font metrics; keep generous)
-    col_w = max(240, cell * 9)
-
-    n = len(actions)
-    ncols = (n + lines_per_col - 1) // lines_per_col
-
-    legend_w = left_pad * 2 + ncols * col_w + max(0, (ncols - 1) * col_gap)
-    out_w = base.size[0] + legend_w
-
-    # create new canvas and paste base image
-    out = Image.new("RGB", (out_w, out_h), (0, 0, 0))
-    out.paste(base, (0, 0))
-    draw = ImageDraw.Draw(out)
-
-    # title (only once, first column)
-    x_start = base.size[0] + left_pad
-    y_start = top_pad
-    draw.text((x_start, y_start), f"Top actions (k={n})", fill=(255, 255, 255))
-
-    # draw entries column by column
-    y0 = y_start + title_h
-    for i, (a, p) in enumerate(zip(actions, probs)):
-        col_idx = i // lines_per_col
-        row_idx = i % lines_per_col
-
-        x = x_start + col_idx * (col_w + col_gap)
-        y = y0 + row_idx * line_h
-
-        col = rank_color(i, n)
-
-        # swatch
-        draw.rectangle((x, y + 3, x + sw, y + 3 + sw), fill=col)
-
-        # decode
-        src, d, m = _decode_action_flat(int(a))
-        rr = src // W
-        cc = src % W
-
-        txt = f"#{i+1:02d} p={p:.3f} src=({rr},{cc}) d={d} m={m}"
-        draw.text((x + sw + 6, y), txt, fill=(230, 230, 230))
-
-    return np.asarray(out)
-
-# ----------------------------
-# Top-k probability computation
-# ----------------------------
 @torch.no_grad()
 def _topk_legal_actions(
     policy,
-    x_img: torch.Tensor,              # (1,T,C,H,W)
-    x_meta: torch.Tensor,             # (1,T,M)
-    legal_action_mask: torch.Tensor,  # (1,A) bool
+    x_img: torch.Tensor,
+    x_meta: torch.Tensor,
+    legal_action_mask: torch.Tensor,
     k: int = 10,
 ):
-    """
-    Return top-k legal actions and probs.
+    assert x_img.shape[0] == 1
+    legal_flat = legal_action_mask[0].to(torch.bool)
 
-    Supports:
-      1) Joint-logits policies (e.g. SeqPPOPolicySTRoPE2D): logits_flat = (1, A)
-         -> p = softmax(masked_logits)
-      2) Factorized policies (old): p(a)=p(src)*p(dir|src)*p(mode|src)
-    """
-    assert x_img.shape[0] == 1, "viz assumes batch=1 for topk"
-    B = 1
-
-    A = legal_action_mask.shape[1]
-    legal_flat = legal_action_mask[0].to(torch.bool)  # (A,)
-
-    # -------------------------
-    # (1) NEW: Joint logits policy (policy_st_rope2d.py)
-    # -------------------------
     if hasattr(policy, "logits_and_value"):
-        # logits_flat: (1, A)
         logits_flat, _v = policy.logits_and_value(x_img, x_meta)
-        logits_flat = logits_flat.view(-1)  # (A,)
+        logits_flat = logits_flat.view(-1)
 
-        # masked softmax over legal actions
         masked_logits = logits_flat.masked_fill(~legal_flat, -1e9)
-        p_flat = F.softmax(masked_logits, dim=-1)  # (A,)
-
-        # if all zeros (shouldn't), fallback
-        if float(p_flat.sum().item()) <= 0:
-            legal_idx = torch.nonzero(legal_flat).view(-1)
-            kk = min(int(k), int(legal_idx.numel()))
-            top_a = legal_idx[:kk]
-            top_p = torch.ones_like(top_a, dtype=torch.float32) / max(1, kk)
-            return top_a.tolist(), top_p.tolist()
+        p_flat = F.softmax(masked_logits, dim=-1)
 
         kk = min(int(k), int(legal_flat.sum().item()))
         top_p, top_a = torch.topk(p_flat, k=kk, largest=True, sorted=True)
         return top_a.tolist(), top_p.tolist()
 
-    assert False
+    raise RuntimeError("Policy does not support logits_and_value for topk visualization.")
 
-# ----------------------------
-# Main viz hook
-# ----------------------------
-def maybe_visualize_rollout_step(
+
+def make_viz_frame(
     vs: VizState,
     env: GeneralsEnvWithMemory,
-    upd: int,
-    step: int,
-    a0: int,
-    a1: int,
-    r: float,
-    v: float,
-    logp: float,
-    done: bool,
-    # NEW: for top-k prediction visualization (P0)
     policy=None,
-    x_img: Optional[torch.Tensor] = None,    # (1,T,C,H,W)
-    x_meta: Optional[torch.Tensor] = None,   # (1,T,M)
-    legal_mask: Optional[torch.Tensor] = None,  # (1,A) bool
-):
-    if not vs.do_viz:
-        return
-
-    # trace each step
-    if vs.trace_f is not None:
-        vs.trace_f.write(json.dumps({
-            "upd": int(upd),
-            "step": int(step),
-            "half_t": int(env.env.half_t),
-            "a0": int(a0),
-            "a1": int(a1),
-            "r": float(r),
-            "v": float(v),
-            "logp": float(logp),
-            "done": bool(done),
-        }, ensure_ascii=False) + "\n")
-
-    # only save frames sparsely
-    if (step % vs.stride != 0) or (vs.saved >= vs.frames_per_update):
-        return
-
-    if imageio is None:
-        raise RuntimeError("Visualization requires imageio. pip install imageio imageio-ffmpeg")
-
-    # Render base frame
+    x_img: Optional[torch.Tensor] = None,
+    x_meta: Optional[torch.Tensor] = None,
+    legal_mask: Optional[torch.Tensor] = None,
+) -> np.ndarray:
     frame = render_full_frame(env, cell=vs.cell, draw_text=vs.draw_text, pov_player=vs.pov_player)
 
-    # Top-k legal actions (optional)
     if vs.topk_actions > 0 and policy is not None and x_img is not None and x_meta is not None and legal_mask is not None:
         try:
             top_actions, top_probs = _topk_legal_actions(policy, x_img, x_meta, legal_mask, k=int(vs.topk_actions))
-
-            if vs.print_topk:
-                # print as: rank prob src r,c dir mode flat
-                H = env.env.H
-                W = env.env.W
-                print(f"[viz][upd={upd} step={step} half_t={int(env.env.half_t)}] top{len(top_actions)} legal actions:")
-                for i, (aa, pp) in enumerate(zip(top_actions, top_probs), 1):
-                    src, d, m = _decode_action_flat(int(aa))
-                    rr = src // W
-                    cc = src % W
-                    print(f"  #{i:02d} p={pp:.5f}  flat={int(aa):4d}  src={src:3d}({rr:02d},{cc:02d})  dir={d}  mode={m}")
-
             if vs.draw_arrows:
                 frame = _draw_arrows_on_frame(
                     frame,
@@ -618,12 +474,118 @@ def maybe_visualize_rollout_step(
         except Exception as e:
             print(f"[viz] topk/arrow failed: {e}")
 
-    # Save png
-    # png_path = os.path.join(vs.out_dir, f"upd_{upd:06d}_step_{step:04d}_half_t_{int(env.env.half_t):05d}.png")
-    # imageio.imwrite(png_path, frame)
+    return frame
 
-    # Append to mp4
+
+# ----------------------------
+# Compatibility: keep old single-env function
+# ----------------------------
+def maybe_visualize_rollout_step(
+    vs: VizState,
+    env: GeneralsEnvWithMemory,
+    upd: int,
+    step: int,
+    a0: int,
+    a1: int,
+    r: float,
+    v: float,
+    logp: float,
+    done: bool,
+    policy=None,
+    x_img: Optional[torch.Tensor] = None,
+    x_meta: Optional[torch.Tensor] = None,
+    legal_mask: Optional[torch.Tensor] = None,
+):
+    if not vs.do_viz:
+        return
+
+    if vs.trace_f is not None:
+        vs.trace_f.write(json.dumps({
+            "upd": int(upd),
+            "step": int(step),
+            "env_id": 0,
+            "half_t": int(env.env.half_t),
+            "a0": int(a0),
+            "a1": int(a1),
+            "r": float(r),
+            "v": float(v),
+            "logp": float(logp),
+            "done": bool(done),
+        }, ensure_ascii=False) + "\n")
+
+    if (step % vs.stride != 0):
+        return
+    if vs.saved >= int(vs.frames_per_update):
+        return
+
+    fr = make_viz_frame(vs, env, policy=policy, x_img=x_img, x_meta=x_meta, legal_mask=legal_mask)
     if vs.writer is not None:
-        vs.writer.append_data(frame)
+        vs.writer.append_data(fr)
+        vs.saved += 1
 
-    vs.saved += 1
+
+# ----------------------------
+# Concat mode collector:
+# buffer per env, then `viz_end_update` writes in env order with GLOBAL cap.
+# ----------------------------
+def maybe_visualize_rollout_step_concat(
+    vs: VizState,
+    envs: List[GeneralsEnvWithMemory],
+    upd: int,
+    step: int,
+    a0_list: List[int],
+    a1_list: List[int],
+    r_list: List[float],
+    v_list: List[float],
+    logp_list: List[float],
+    done_list: List[bool],
+    policy=None,
+    x_img_batch: Optional[torch.Tensor] = None,      # (E,T,C,H,W)
+    x_meta_batch: Optional[torch.Tensor] = None,     # (E,T,M)
+    legal_mask_batch: Optional[torch.Tensor] = None, # (E,A)
+):
+    if not vs.do_viz:
+        return
+
+    E = len(envs)
+    if not vs.frame_buf:
+        vs.frame_buf = [[] for _ in range(E)]
+
+    if vs.trace_f is not None:
+        for i in range(E):
+            vs.trace_f.write(json.dumps({
+                "upd": int(upd),
+                "step": int(step),
+                "env_id": int(i),
+                "half_t": int(envs[i].env.half_t),
+                "a0": int(a0_list[i]),
+                "a1": int(a1_list[i]),
+                "r": float(r_list[i]),
+                "v": float(v_list[i]),
+                "logp": float(logp_list[i]),
+                "done": bool(done_list[i]),
+            }, ensure_ascii=False) + "\n")
+
+    if (step % vs.stride) != 0:
+        return
+
+    # NOTE: we don't try to enforce the GLOBAL cap here (would require prioritization policy during collection).
+    # We only do a reasonable per-env bound to avoid runaway memory,
+    # and the final GLOBAL cap + env-order truncation is enforced in viz_end_update.
+    per_env_soft_cap = int(vs.frames_per_update)
+
+    for i in range(E):
+        if len(vs.frame_buf[i]) >= per_env_soft_cap:
+            continue
+
+        xi = xm = lm = None
+        if policy is not None and x_img_batch is not None and x_meta_batch is not None and legal_mask_batch is not None:
+            xi = x_img_batch[i:i+1]
+            xm = x_meta_batch[i:i+1]
+            lm = legal_mask_batch[i:i+1]
+
+        fr = make_viz_frame(vs, envs[i], policy=policy, x_img=xi, x_meta=xm, legal_mask=lm)
+        vs.frame_buf[i].append(fr)
+
+    # saved here is "collected", actual "written" is decided at viz_end_update with global cap
+    vs.saved = min(int(vs.frames_per_update), sum(len(x) for x in vs.frame_buf))

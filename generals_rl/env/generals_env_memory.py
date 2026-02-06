@@ -86,6 +86,11 @@ class GeneralsEnvWithMemory:
 
     def legal_action_mask(self, p: Owner) -> np.ndarray:
         return self.env.legal_action_mask(p)
+    def clone(self):
+        """Deep-copy the whole env (for MCTS)."""
+        import copy as _copy
+        return _copy.deepcopy(self)
+
 
     # ---- core API ----
     def reset(self) -> Tuple[Tuple[Dict[str, np.ndarray], Dict[str, np.ndarray]], Dict]:
