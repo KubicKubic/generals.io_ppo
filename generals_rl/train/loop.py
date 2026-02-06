@@ -10,8 +10,6 @@ import torch
 import torch.optim as optim
 
 from ..env.generals_env import Owner, TileType
-from ..data.history import ObsHistory
-from ..data.encoding import encode_obs_sequence
 from ..models.registry import make_policy
 from ..mcts.alphazero_mcts import AlphaZeroMCTSPolicy, MCTSConfig as _MCTSConfig
 
@@ -57,24 +55,19 @@ def train(cfg: TrainConfig, device=None):
 
     seeder = EpisodeSeeder(cfg.env)
 
-    envs = []
+    envs: List = []
     obs0_list = []
     obs1_list = []
-    h0_list = []
-    h1_list = []
+
+    # Make env obs cache length follow TrainConfig.T unless user overrides env.obs_T explicitly
+    if getattr(cfg.env, "obs_T", None) is None:
+        cfg.env.obs_T = int(cfg.T)
 
     for _ in range(num_envs):
         env_i, o0, o1 = reset_episode(None, cfg.env, seeder)
         envs.append(env_i)
         obs0_list.append(o0)
         obs1_list.append(o1)
-
-        h0 = ObsHistory(max_len=int(cfg.T))
-        h1 = ObsHistory(max_len=int(cfg.T))
-        h0.reset(o0)
-        h1.reset(o1)
-        h0_list.append(h0)
-        h1_list.append(h1)
 
     # ---- model selection via config ----
     env0 = envs[0]
@@ -100,7 +93,7 @@ def train(cfg: TrainConfig, device=None):
     start_update = 1
 
     def _terminal_stats_from_env(env_):
-        e = env_.env
+        e = env_
         owner = e.owner
         army = e.army
         tile = e.tile_type
@@ -143,8 +136,6 @@ def train(cfg: TrainConfig, device=None):
 
         for i in range(num_envs):
             envs[i], obs0_list[i], obs1_list[i] = reset_episode(envs[i], cfg.env, seeder)
-            h0_list[i].reset(obs0_list[i])
-            h1_list[i].reset(obs1_list[i])
 
         print(f"[resume] loaded {cfg.resume_path} at update={ck['update']} pool={len(opponent_pool)}")
 
@@ -175,8 +166,6 @@ def train(cfg: TrainConfig, device=None):
         if do_viz and bool(cfg.viz.reset_episode_before_viz):
             for i in range(num_envs):
                 envs[i], obs0_list[i], obs1_list[i] = reset_episode(envs[i], cfg.env, seeder)
-                h0_list[i].reset(obs0_list[i])
-                h1_list[i].reset(obs1_list[i])
 
         vs = viz_begin_update(
             do_viz=do_viz,
@@ -217,8 +206,9 @@ def train(cfg: TrainConfig, device=None):
             T_lens = []
 
             for i in range(num_envs):
-                seq0 = h0_list[i].get_padded_seq() if cfg.seq_padding else h0_list[i].get_seq()
-                x_img_seq_i, x_meta_seq_i = encode_obs_sequence(seq0, player_id=0)
+                img_np, meta_np = envs[i].get_model_obs_seq(Owner.P0, padded=bool(cfg.seq_padding))
+                x_img_seq_i = torch.from_numpy(img_np)   # (t,C,H,W)
+                x_meta_seq_i = torch.from_numpy(meta_np) # (t,M)
                 x_img_seq_list.append(x_img_seq_i)
                 x_meta_seq_list.append(x_meta_seq_i)
                 T_lens.append(int(x_img_seq_i.shape[0]))
@@ -238,7 +228,7 @@ def train(cfg: TrainConfig, device=None):
                 # MCTS action selection (per-env, sequential)
                 a0_list = []
                 for i in range(len(envs)):
-                    a_i, _ = mcts_policy.select_action(envs[i], h0_list[i], h1_list[i], player=Owner.P0)
+                    a_i, _ = mcts_policy.select_action(envs[i], player=Owner.P0)
                     a0_list.append(int(a_i))
                 a0 = torch.tensor(a0_list, device=device, dtype=torch.long)
                 logp0, _, v0 = policy.evaluate_actions(x_img0, x_meta0, mask0, a0)
@@ -248,10 +238,8 @@ def train(cfg: TrainConfig, device=None):
             a1_list = choose_opponent_action_batched(
                 envs,
                 opp,
-                h1_list,
                 device=device,
                 random_prob=float(cfg.opponent.random_opp_prob),
-                T=int(cfg.T),
                 seq_padding=bool(cfg.seq_padding),
             )
 
@@ -282,9 +270,6 @@ def train(cfg: TrainConfig, device=None):
                 logp_list_float.append(float(logp0[i].item()))
 
                 obs0_list[i], obs1_list[i] = obs0_next, obs1_next
-                h0_list[i].push(obs0_next)
-                h1_list[i].push(obs1_next)
-
                 if done:
                     ep_count += 1
 
@@ -305,8 +290,6 @@ def train(cfg: TrainConfig, device=None):
                         term_sum_p1_cities += p1c
 
                     envs[i], obs0_list[i], obs1_list[i] = reset_episode(envs[i], cfg.env, seeder)
-                    h0_list[i].reset(obs0_list[i])
-                    h1_list[i].reset(obs1_list[i])
 
             buf.add_step(
                 x_img_seq=x_img_step,
@@ -344,8 +327,9 @@ def train(cfg: TrainConfig, device=None):
         x_meta_seq_list = []
         T_lens = []
         for i in range(num_envs):
-            seq0 = h0_list[i].get_padded_seq() if cfg.seq_padding else h0_list[i].get_seq()
-            x_img_seq_i, x_meta_seq_i = encode_obs_sequence(seq0, player_id=0)
+            img_np, meta_np = envs[i].get_model_obs_seq(Owner.P0, padded=bool(cfg.seq_padding))
+            x_img_seq_i = torch.from_numpy(img_np)
+            x_meta_seq_i = torch.from_numpy(meta_np)
             x_img_seq_list.append(x_img_seq_i)
             x_meta_seq_list.append(x_meta_seq_i)
             T_lens.append(int(x_img_seq_i.shape[0]))

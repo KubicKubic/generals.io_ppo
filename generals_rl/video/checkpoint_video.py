@@ -18,8 +18,8 @@ except Exception:
     ImageFont = None
 
 from ..env.generals_env import Owner, TileType
-from ..env.generals_env_memory import GeneralsEnvWithMemory
-from ..data import ObsHistory, encode_obs_sequence
+from ..env.generals_env import GeneralsEnv
+from ..data import ObsHistory
 
 # ---------- rendering helpers ----------
 def _clamp(x, lo, hi):
@@ -98,7 +98,7 @@ def _to_int_enumish(x, fallback: int = 0) -> int:
 
 
 def render_full_frame(
-    env_mem: GeneralsEnvWithMemory,
+    env_mem: GeneralsEnv,
     cell: int = 20,
     draw_text: bool = True,
     pov_player: int = 0,
@@ -286,7 +286,7 @@ def run_one_game_and_record(
     os.makedirs(os.path.dirname(out_mp4) or ".", exist_ok=True)
 
     # env
-    env = GeneralsEnvWithMemory(seed=seed, max_halfturns=max_halfturns)
+    env = GeneralsEnv(seed=seed, max_halfturns=max_halfturns)
     (obs0, obs1), _ = env.reset()
 
     # policy
@@ -365,10 +365,9 @@ def run_one_game_and_record(
 
         while True:
             # P0 action (deterministic argmax)
-            seq0 = h0.get_padded_seq()
-            x_img0_seq, x_meta0_seq = encode_obs_sequence(seq0, player_id=0)
-            x_img0 = x_img0_seq.unsqueeze(0).to(device)
-            x_meta0 = x_meta0_seq.unsqueeze(0).to(device)
+            img_np, meta_np = env.get_model_obs_seq(Owner.P0, padded=True)
+            x_img0 = torch.from_numpy(img_np).unsqueeze(0).to(device)
+            x_meta0 = torch.from_numpy(meta_np).unsqueeze(0).to(device)
 
             mask0_np = env.legal_action_mask(Owner.P0)
             mask0 = torch.from_numpy(mask0_np).unsqueeze(0).to(device).to(torch.bool)
@@ -381,8 +380,7 @@ def run_one_game_and_record(
             a1 = int(np.random.choice(legal1)) if len(legal1) > 0 else 0
 
             res = env.step(int(a0), int(a1))
-            obs0, obs1 = res.obs
-            h0.push(obs0); h1.push(obs1)
+            # env maintains model-obs cache internally
 
             append_frame_repeated()
 

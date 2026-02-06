@@ -23,6 +23,7 @@ from dataclasses import dataclass
 from enum import IntEnum
 from typing import Optional, Tuple, Dict, List
 import numpy as np
+import copy
 
 
 # -----------------------------
@@ -153,26 +154,24 @@ class GeneralsEnv:
         enable_chase_priority: bool = True,
 
         # map constraints
-        # min_real_size: int = 15,
-        # max_real_size: int = 25,
-        # min_general_dist: int = 15,
-        min_real_size: int = 5,
-        max_real_size: int = 6,
-        min_general_dist: int = 5,
+        min_real_size: int = 15,
+        max_real_size: int = 25,
+        min_general_dist: int = 15,
 
         # map distribution knobs (NEW)
         mountain_ratio_low: float = 1.0 / 8.0,
         mountain_ratio_high: float = 1.0 / 4.0,
-        city_count_low: int = 0,
-        city_count_high: int = 1,
+        city_count_low: int = 4,
+        city_count_high: int = 10,
+
+        # observation knobs
+        fog_of_war: bool = True,
+        obs_T: int = 1,
 
         # action-space constraint
         forbid_mode1: bool = False,
     ):
         self.H, self.W = int(H), int(W)
-        if self.H != 25 or self.W != 25:
-            # You can change this, but your requirement says default 25.
-            pass
 
         self.rng = np.random.default_rng(seed)
 
@@ -210,12 +209,33 @@ class GeneralsEnv:
         # If True, disallow actions with mode==1 when computing legal action masks.
         self.forbid_mode1 = bool(forbid_mode1)
 
+        # observation knobs
+        self.fog_of_war = bool(fog_of_war)
+        self.obs_T = int(obs_T)
+
         # state arrays are fixed size (25x25 by default)
         self.tile_type = np.zeros((self.H, self.W), dtype=np.int8)
         self.owner = np.full((self.H, self.W), Owner.NEUTRAL, dtype=np.int8)
         self.army = np.zeros((self.H, self.W), dtype=np.int32)
 
         self.general_pos: Dict[Owner, Optional[Tuple[int, int]]] = {Owner.P0: None, Owner.P1: None}
+
+        # ---- model input cache (kept inside env; updated on reset/step) ----
+        # Shapes:
+        #   img: (T, C, H, W) float32
+        #   meta: (T, M) float32
+        self._C = 20
+        self._M = 10
+        self._buf_img = {
+            Owner.P0: np.zeros((self.obs_T, self._C, self.H, self.W), dtype=np.float32),
+            Owner.P1: np.zeros((self.obs_T, self._C, self.H, self.W), dtype=np.float32),
+        }
+        self._buf_meta = {
+            Owner.P0: np.zeros((self.obs_T, self._M), dtype=np.float32),
+            Owner.P1: np.zeros((self.obs_T, self._M), dtype=np.float32),
+        }
+        self._buf_len = 0
+        self._buf_pos = 0  # next write index (circular)
 
         # real map size for current episode
         self.real_H = self.H
@@ -235,13 +255,17 @@ class GeneralsEnv:
     # -----------------------------
     # Public API
     # -----------------------------
-    def reset(self) -> Tuple[Tuple[Dict[str, np.ndarray], Dict[str, np.ndarray]], Dict]:
+    def reset(self, seed: Optional[int] = None) -> Tuple[Tuple[Dict[str, np.ndarray], Dict[str, np.ndarray]], Dict]:
         self.half_t = 0
         self.t = 0
+        if seed is not None:
+            self.rng = np.random.default_rng(int(seed))
         self._generate_map()
+        self._cache_reset()
 
         obs0 = self._make_obs(Owner.P0)
         obs1 = self._make_obs(Owner.P1)
+        self._cache_push(obs0, obs1)
         return (obs0, obs1), {
             "half_t": self.half_t,
             "turn": self.half_t // 2,
@@ -281,6 +305,7 @@ class GeneralsEnv:
 
         obs0 = self._make_obs(Owner.P0)
         obs1 = self._make_obs(Owner.P1)
+        self._cache_push(obs0, obs1)
         info = {
             "half_t": self.half_t,
             "turn": self.half_t // 2,
@@ -659,7 +684,10 @@ class GeneralsEnv:
         return army0, army1, land0, land1
 
     def _make_obs(self, p: Owner) -> Dict[str, np.ndarray]:
-        vis = self._visible_mask(p)
+        if self.fog_of_war:
+            vis = self._visible_mask(p)
+        else:
+            vis = np.ones((self.H, self.W), dtype=np.bool_)
 
         # Fog rendering for tile_type:
         #  - MOUNTAIN and CITY render as MOUNTAIN
@@ -906,6 +934,133 @@ class GeneralsEnv:
 # -----------------------------
 # Quick sanity check (optional)
 # -----------------------------
+
+
+    # -----------------------------
+    # Model input cache (no encode_obs_sequence)
+    # -----------------------------
+    def _encode_frame(self, obs: Dict[str, np.ndarray], *, player: Owner) -> Tuple[np.ndarray, np.ndarray]:
+        """Encode ONE observation dict into (C,H,W) and (M,) float32 arrays."""
+        H, W = self.H, self.W
+        self_id = int(player)
+        opp_id = 1 - self_id
+
+        tile = obs["tile_type"].astype(np.int32)
+        owner = obs["owner"].astype(np.int32)
+        army = obs["army"].astype(np.int32)
+        vis = obs["visible"].astype(np.float32)
+
+        x_img = np.zeros((self._C, H, W), dtype=np.float32)
+
+        # tile type one-hot (0..3)
+        for tt in range(4):
+            x_img[tt] = (tile == tt).astype(np.float32)
+
+        x_img[4] = ((owner == self_id) & (vis > 0)).astype(np.float32)
+        x_img[5] = ((owner == opp_id) & (vis > 0)).astype(np.float32)
+        x_img[6] = ((owner == -1) & (vis > 0)).astype(np.float32)
+
+        army_safe = np.maximum(army, 0)
+        self_army = np.where(owner == self_id, army_safe, 0)
+        opp_army = np.where(owner == opp_id, army_safe, 0)
+        x_img[7] = np.log1p(self_army).astype(np.float32)
+        x_img[8] = np.log1p(opp_army).astype(np.float32)
+
+        x_img[9] = vis
+
+        # channels 10..17 reserved for memory tags in old wrapper => keep zeros
+        # channel 18 reserved for exposed city mask => keep zeros
+        x_img[19] = 1.0
+
+        # meta (10,)
+        half_in_turn = float(obs["half_in_turn"][0])
+        turn = int(obs["turn"][0])
+        turn_frac = float(turn % int(self.round_len)) / float(max(1, int(self.round_len)))
+
+        total_army = obs["total_army"].astype(np.float32)
+        total_land = obs["total_land"].astype(np.float32)
+        my_army_total = float(total_army[self_id])
+        opp_army_total = float(total_army[opp_id])
+        my_land_total = float(total_land[self_id])
+        opp_land_total = float(total_land[opp_id])
+
+        real_shape = obs["real_shape"].astype(np.float32)
+        real_h = float(real_shape[0]) / float(max(1, H))
+        real_w = float(real_shape[1]) / float(max(1, W))
+
+        x_meta = np.array(
+            [
+                half_in_turn,
+                turn_frac,
+                np.log1p(my_army_total) / 8.0,
+                np.log1p(opp_army_total) / 8.0,
+                my_land_total / float(max(1, H * W)),
+                opp_land_total / float(max(1, H * W)),
+                real_h,
+                real_w,
+                0.0,   # exposed_my_general_seen (memory wrapper only)
+                0.0,   # exposed_my_city_count (memory wrapper only)
+            ],
+            dtype=np.float32,
+        )
+        return x_img, x_meta
+
+    def _cache_reset(self):
+        self._buf_len = 0
+        self._buf_pos = 0
+
+    def _cache_push(self, obs0: Dict[str, np.ndarray], obs1: Dict[str, np.ndarray]):
+        """Push new obs for both players into circular cache."""
+        if self.obs_T <= 0:
+            return
+        for p, obs in ((Owner.P0, obs0), (Owner.P1, obs1)):
+            x_img, x_meta = self._encode_frame(obs, player=p)
+            self._buf_img[p][self._buf_pos] = x_img
+            self._buf_meta[p][self._buf_pos] = x_meta
+
+        self._buf_pos = (self._buf_pos + 1) % self.obs_T
+        self._buf_len = min(self.obs_T, self._buf_len + 1)
+
+    def get_model_obs_seq(self, player: Owner, *, padded: bool) -> Tuple[np.ndarray, np.ndarray]:
+        """Return (T,C,H,W) and (T,M) arrays from the internal cache.
+
+        If padded=True, always returns length obs_T (left-pad with first cached frame).
+        Otherwise returns the current (<=obs_T) length.
+        """
+        if self._buf_len <= 0:
+            raise RuntimeError("Model obs cache is empty. Call reset() first.")
+
+        # gather in chronological order
+        # oldest index = (buf_pos - buf_len) mod T
+        start = (self._buf_pos - self._buf_len) % self.obs_T
+        if start + self._buf_len <= self.obs_T:
+            img_seq = self._buf_img[player][start:start + self._buf_len]
+            meta_seq = self._buf_meta[player][start:start + self._buf_len]
+        else:
+            a = self._buf_img[player][start:]
+            b = self._buf_img[player][: (start + self._buf_len) % self.obs_T]
+            img_seq = np.concatenate([a, b], axis=0)
+            a2 = self._buf_meta[player][start:]
+            b2 = self._buf_meta[player][: (start + self._buf_len) % self.obs_T]
+            meta_seq = np.concatenate([a2, b2], axis=0)
+
+        if not padded:
+            return img_seq, meta_seq
+
+        if self._buf_len == self.obs_T:
+            return img_seq, meta_seq
+
+        pad_len = self.obs_T - self._buf_len
+        first_img = img_seq[:1]
+        first_meta = meta_seq[:1]
+        img_pad = np.repeat(first_img, pad_len, axis=0)
+        meta_pad = np.repeat(first_meta, pad_len, axis=0)
+        return np.concatenate([img_pad, img_seq], axis=0), np.concatenate([meta_pad, meta_seq], axis=0)
+
+    def clone(self):
+        """Deep clone (used by MCTS)."""
+        return copy.deepcopy(self)
+
 if __name__ == "__main__":
     env = GeneralsEnv(seed=0)
     (o0, o1), info = env.reset()

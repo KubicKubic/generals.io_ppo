@@ -1,43 +1,60 @@
 total_updates: 1200
-rollout_len: 128
+rollout_len: 8192
 T: 1
 lr: 1e-3
 gamma: 0.99
 lam: 0.95
 ckpt_dir: checkpoints
-save_every: 16
+save_every: 1
 log_every: 1
-resume_path: /qiyuan_research_vepfs_001/guoyuchong/my/generals_ppo/checkpoints/ckpt_000096.pt
+resume_path: /qiyuan_research_vepfs_001/guoyuchong/my/generals_ppo/checkpoints/ckpt_000009.pt
 save_policy_path: generals_seq_policy.pt
 save_resolved_config: true
 seq_padding: false
 env:
-  num_envs: 1
+  num_envs: 4
   base_seed: 0
   max_halfturns: 128
   reset_seed_mode: increment
   seed_increment: 1
   forbid_mode1: true
+  H: 8
+  W: 8
+  min_real_size: 5
+  max_real_size: 6
+  min_general_dist: 5
+  round_len: 25
+  vision_radius: 1
+  city_initial_low: 40
+  city_initial_high: 50
+  general_initial: 1
+  round_includes_cities: true
+  enable_chase_priority: true
+  mountain_ratio_low: 0.125
+  mountain_ratio_high: 0.25
+  city_count_low: 0
+  city_count_high: 1
+  fog_of_war: false
 ppo:
   clip_eps: 0.2
   vf_coef: 0.5
-  ent_coef: 0.1
-  epochs: 1
-  minibatch: 128
+  ent_coef: 0.02
+  epochs: 4
+  minibatch: 8192
   max_grad_norm: 1.0
 reward_shaping:
-  w_army: 0.1
-  w_land: 0.1
+  w_army: 0.001
+  w_land: 0.001
 opponent:
-  random_opp_prob: 0.25
+  random_opp_prob: 0.0
   pool_pick_prob: 0.8
   pool_empty_mode: random
   fallback_mode: random
   snapshot_every: 25
   opponent_pool_max: 0
 mcts:
-  enabled: true
-  actor_mode: mcts          # ppo | mcts
+  enabled: false
+  actor_mode: ppo          # ppo | mcts
   num_simulations: 100
   max_depth: 10
   c_puct: 1.5
@@ -53,7 +70,7 @@ video:
 viz:
   enable: true
   out_dir: samples_viz
-  every_updates: 8
+  every_updates: 1
   frames_per_update: 512
   save_mp4: true
   mp4_fps: 2

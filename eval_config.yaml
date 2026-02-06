@@ -1,0 +1,74 @@
+# eval_config.yaml
+# 用法：python eval.py --config eval_config.yaml
+
+# ----------------
+# checkpoints
+# ----------------
+ckpt_a: "/qiyuan_research_vepfs_001/guoyuchong/my/generals_ppo/checkpoints/ckpt_000110.pt"     # policy A 控制 Owner.P0
+ckpt_b: "/qiyuan_research_vepfs_001/guoyuchong/my/generals_ppo/checkpoints/ckpt_000119.pt"     # policy B 控制 Owner.P1
+
+# ----------------
+# parallelism / batching
+# ----------------
+num_envs: 32                    # 每个chunk同时跑多少局（batched推理 + 多env并行rollout）
+
+# ----------------
+# evaluation size
+# ----------------
+num_maps: 128                   # 地图数；每张地图会打两局（交换王位置），总局数= num_maps * 2
+base_seed: 0                    # 起始seed
+seed_increment: 1               # 每张地图seed递增步长
+
+# ----------------
+# policy inference
+# ----------------
+device: "cuda"                  # "cuda" / "cpu"
+predict_mode: "sample"          # "sample" 或 "argmax"
+seq_padding: false              # 是否做序列padding（按你模型实现需要；一般 false 即可）
+
+# ----------------
+# io
+# ----------------
+out_dir: "eval_runs"            # 输出根目录
+run_name: ""                    # 留空则自动用时间戳命名
+
+# ----------------
+# env (必须与 ckpt 训练时的结构兼容，否则 load 会维度不匹配)
+# ----------------
+env:
+  # map / rules
+  H: 25
+  W: 25
+  min_real_size: 15
+  max_real_size: 25
+  min_general_dist: 5
+
+  round_len: 25
+  vision_radius: 1
+  city_initial_low: 40
+  city_initial_high: 50
+  general_initial: 1
+  round_includes_cities: true
+  enable_chase_priority: true
+
+  mountain_ratio_low: 0.125     # 1/8
+  mountain_ratio_high: 0.25     # 1/4
+  city_count_low: 0
+  city_count_high: 1
+
+  fog_of_war: true
+
+  # 单局步数上限（注意：eval.py 用的是 half-turn 计数）
+  max_halfturns: 600
+
+  # 模型输入序列长度（T），需要和训练时一致（或至少与ckpt模型兼容）
+  obs_T: 32
+
+  # action-space 约束（需与训练一致）
+  forbid_mode1: true
+
+# ----------------
+# model overrides (可选；通常应留空让 ckpt 自带配置决定结构)
+# eval.py 里类型是 Dict[str, Any]，所以这里写任意 dict 都行。
+# ----------------
+model: null

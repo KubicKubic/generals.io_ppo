@@ -13,8 +13,6 @@ import numpy as np
 import torch
 
 from ..env.generals_env import Owner
-from ..data.encoding import encode_obs_sequence
-from ..data.history import ObsHistory
 
 
 @dataclass
@@ -78,11 +76,6 @@ def _clone_env(env):
     return copy.deepcopy(env)
 
 
-def _clone_hist(h: ObsHistory) -> ObsHistory:
-    h2 = ObsHistory(max_len=h.max_len)
-    h2.buf = list(h.buf)
-    return h2
-
 
 def _state_key(env) -> bytes:
     """
@@ -119,11 +112,10 @@ class AlphaZeroMCTSPolicy:
         self._nodes: Dict[bytes, _Node] = {}
 
     @torch.no_grad()
-    def _prior_and_value(self, hist: ObsHistory, *, player_id: int, legal_mask_np: np.ndarray) -> Tuple[np.ndarray, float]:
-        seq = hist.get_padded_seq()
-        x_img_seq, x_meta_seq = encode_obs_sequence(seq, player_id=player_id)
-        x_img = x_img_seq.unsqueeze(0).to(self.device)
-        x_meta = x_meta_seq.unsqueeze(0).to(self.device)
+    def _prior_and_value(self, env_sim, *, player: Owner, legal_mask_np: np.ndarray) -> Tuple[np.ndarray, float]:
+        img_np, meta_np = env_sim.get_model_obs_seq(player, padded=True)
+        x_img = torch.from_numpy(img_np).unsqueeze(0).to(self.device)   # (1,T,C,H,W)
+        x_meta = torch.from_numpy(meta_np).unsqueeze(0).to(self.device) # (1,T,M)
         mask = torch.from_numpy(legal_mask_np).to(self.device).to(torch.bool).unsqueeze(0)
 
         logits, v = self.base_policy.logits_and_value(x_img, x_meta)
@@ -169,7 +161,7 @@ class AlphaZeroMCTSPolicy:
         return out
 
     @torch.no_grad()
-    def _opponent_action(self, env_sim, h0: ObsHistory, h1: ObsHistory, *, player: Owner) -> int:
+    def _opponent_action(self, env_sim, *, player: Owner) -> int:
         opp_player = Owner.P1 if player == Owner.P0 else Owner.P0
         mask_np = env_sim.legal_action_mask(opp_player)
         legal = np.flatnonzero(mask_np)
@@ -179,8 +171,7 @@ class AlphaZeroMCTSPolicy:
         if str(self.cfg.opponent_model).lower() == "random":
             return int(random.choice(list(legal)))
 
-        opp_hist = h1 if opp_player == Owner.P1 else h0
-        priors, _ = self._prior_and_value(opp_hist, player_id=int(opp_player), legal_mask_np=mask_np)
+        priors, _ = self._prior_and_value(env_sim, player=opp_player, legal_mask_np=mask_np)
 
         if str(self.cfg.opponent_sample).lower() == "argmax":
             return int(np.argmax(priors))
@@ -194,7 +185,7 @@ class AlphaZeroMCTSPolicy:
             self._nodes[key] = n
         return n
 
-    def _expand_node(self, node: _Node, env_sim, h0: ObsHistory, h1: ObsHistory, *, player: Owner, root: bool) -> float:
+    def _expand_node(self, node: _Node, env_sim, *, player: Owner, root: bool) -> float:
         mask_np = env_sim.legal_action_mask(player)
         legal = np.flatnonzero(mask_np)
         node.legal_actions = [int(a) for a in legal]
@@ -202,8 +193,7 @@ class AlphaZeroMCTSPolicy:
             node.expanded = True
             return 0.0
 
-        hist = h0 if player == Owner.P0 else h1
-        priors, v = self._prior_and_value(hist, player_id=int(player), legal_mask_np=mask_np)
+        priors, v = self._prior_and_value(env_sim, player=player, legal_mask_np=mask_np)
         if root:
             priors = self._apply_root_noise(priors, mask_np)
 
@@ -265,35 +255,30 @@ class AlphaZeroMCTSPolicy:
         """Call this if you don't want to reuse nodes across moves."""
         self._nodes.clear()
 
-    def select_action(self, env, h0: ObsHistory, h1: ObsHistory, *, player: Owner) -> Tuple[int, np.ndarray]:
-        """
-        Returns (action, pi_mcts) for the given player at the current root state.
+    def select_action(self, env, *, player: Owner) -> Tuple[int, np.ndarray]:
+        """Returns (action, pi_mcts) for the given player at the current root state.
+
+        NOTE: This uses the env's internal model-obs cache (no ObsHistory / no encode_obs_sequence).
         """
         root_env = env
         root_key = _state_key(root_env)
         root_node = self._get_node(root_key)
 
-        # expand root if needed
         if not root_node.expanded:
-            _ = self._expand_node(root_node, root_env, h0, h1, player=player, root=True)
+            _ = self._expand_node(root_node, root_env, player=player, root=True)
 
         action_size = int(root_env.action_size)
 
-        # simulations
         for _ in range(int(self.cfg.num_simulations)):
             env_sim = _clone_env(env)
-            h0_sim = _clone_hist(h0)
-            h1_sim = _clone_hist(h1)
 
             path: List[Tuple[_Node, int]] = []
             cur_key = _state_key(env_sim)
             cur_node = self._get_node(cur_key)
 
-            for depth in range(int(self.cfg.max_depth)):
-                # terminal?
-                # (need to detect terminal by stepping; env doesn't expose done flag directly, so we check via legal mask + max_halfturns is trunc)
+            for _depth in range(int(self.cfg.max_depth)):
                 if not cur_node.expanded:
-                    leaf_v = self._expand_node(cur_node, env_sim, h0_sim, h1_sim, player=player, root=False)
+                    leaf_v = self._expand_node(cur_node, env_sim, player=player, root=False)
                     self._backup(path, leaf_v)
                     break
 
@@ -304,13 +289,12 @@ class AlphaZeroMCTSPolicy:
                 a = self._select_puct(cur_node)
                 path.append((cur_node, a))
 
-                opp_a = self._opponent_action(env_sim, h0_sim, h1_sim, player=player)
+                opp_a = self._opponent_action(env_sim, player=player)
                 if player == Owner.P0:
                     res = env_sim.step(a, opp_a)
                 else:
                     res = env_sim.step(opp_a, a)
 
-                # terminal reward (sparse win/lose)
                 done = bool(res.terminated or res.truncated)
                 r0, r1 = res.reward
                 if done:
@@ -318,17 +302,12 @@ class AlphaZeroMCTSPolicy:
                     self._backup(path, leaf_v)
                     break
 
-                o0, o1 = res.obs
-                h0_sim.push(o0)
-                h1_sim.push(o1)
-
                 cur_key = _state_key(env_sim)
                 cur_node = self._get_node(cur_key)
             else:
-                # reached max_depth; bootstrap value
-                hist = h0_sim if player == Owner.P0 else h1_sim
+                # reached max_depth; bootstrap value from policy value head
                 mask_np = env_sim.legal_action_mask(player)
-                _, leaf_v = self._prior_and_value(hist, player_id=int(player), legal_mask_np=mask_np)
+                _, leaf_v = self._prior_and_value(env_sim, player=player, legal_mask_np=mask_np)
                 self._backup(path, leaf_v)
 
         pi = self._root_pi(root_node, action_size=action_size)

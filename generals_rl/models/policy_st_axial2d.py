@@ -8,11 +8,7 @@ import torch.nn as nn
 
 
 def masked_categorical(logits: torch.Tensor, mask: torch.Tensor) -> torch.distributions.Categorical:
-    """
-    logits: float tensor
-    mask: bool tensor, True=legal
-    """
-    masked_logits = logits.masked_fill(~mask, torch.finfo(logits.dtype).min)
+    masked_logits = logits.masked_fill(~mask, -1e9)
     return torch.distributions.Categorical(logits=masked_logits)
 
 
@@ -239,7 +235,7 @@ class AxialHead2D(nn.Module):
 
 
 # ---------------------------
-# Main policy (Axial spatial, RoPE temporal)  [BF16 core]
+# Main policy (Axial spatial, RoPE temporal)
 # ---------------------------
 class SeqPPOPolicySTAxial2D(nn.Module):
     """
@@ -266,9 +262,6 @@ class SeqPPOPolicySTAxial2D(nn.Module):
         nhead_axial: int = 8,
         nlayers_axial_enc: int = 2,
         nlayers_axial_head: int = 2,
-
-        # <<< BF16 core
-        dtype: torch.dtype = torch.bfloat16,
     ):
         super().__init__()
         self.H = int(H)
@@ -279,7 +272,6 @@ class SeqPPOPolicySTAxial2D(nn.Module):
         self.D = int(d_model)
 
         self.action_size = self.H * self.W * 8
-        self.core_dtype = dtype  # record desired core dtype
 
         self.meta_mlp = nn.Sequential(
             nn.Linear(self.M, self.meta_proj),
@@ -287,6 +279,7 @@ class SeqPPOPolicySTAxial2D(nn.Module):
         )
 
         # spatial frame encoder: (L + meta_proj) -> D
+        # we choose axial internal dim then project to D
         self.frame_encoder_axial = AxialEncoder2D(
             cin=self.L + self.meta_proj,
             d_model=d_model,
@@ -317,10 +310,6 @@ class SeqPPOPolicySTAxial2D(nn.Module):
             nn.Linear(self.D, 1),
         )
 
-        # Make the whole model "core" bf16 (parameters + buffers).
-        # (Device is controlled by caller via .to(device) or model.to(device).)
-        self.to(dtype=self.core_dtype)
-
     def _meta_map(self, meta_proj: torch.Tensor, H: int, W: int) -> torch.Tensor:
         B = meta_proj.shape[0]
         return meta_proj[:, :, None, None].expand(B, meta_proj.shape[1], H, W)
@@ -343,8 +332,8 @@ class SeqPPOPolicySTAxial2D(nn.Module):
         x_cat = torch.cat([x_img, meta_maps], dim=2)  # (B,T,L+meta_proj,H,W)
 
         x_flat = x_cat.reshape(B * T, L + self.meta_proj, H, W)
-        z = self.frame_encoder_axial(x_flat)           # (B*T, D, H, W)
-        f = z.view(B, T, self.D, H, W)                 # (B,T,D,H,W)
+        z = self.frame_encoder_axial(x_flat)           # (B*T, axial_d, H, W)
+        f = z.view(B, T, self.D, H, W)            # (B,T,D,H,W)
 
         meta_last_map = self._meta_map(meta_all[:, -1], H, W)
         return f, meta_all, meta_last_map
@@ -370,12 +359,6 @@ class SeqPPOPolicySTAxial2D(nn.Module):
           logits_flat: (B, H*W*8)
           value: (B,)
         """
-        # Auto-cast float inputs to bf16 core dtype.
-        if x_img.is_floating_point() and x_img.dtype != self.core_dtype:
-            x_img = x_img.to(dtype=self.core_dtype)
-        if x_meta.is_floating_point() and x_meta.dtype != self.core_dtype:
-            x_meta = x_meta.to(dtype=self.core_dtype)
-
         B, T, L, H, W = x_img.shape
         f, _meta_all, meta_last_map = self._encode_frames(x_img, x_meta)
         g_last = self._time_transform_last(f)              # (B,D,H,W)

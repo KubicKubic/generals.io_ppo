@@ -22,7 +22,7 @@ except Exception:
     ImageFont = None
 
 from ..env.generals_env import Owner, TileType
-from ..env.generals_env_memory import GeneralsEnvWithMemory
+from ..env.generals_env import GeneralsEnv
 
 
 # ----------------------------
@@ -100,15 +100,40 @@ def _to_int_enumish(x, fallback: int = 0) -> int:
     return int(fallback)
 
 
+def _make_hud_text(env: GeneralsEnv) -> str:
+    turn = env.half_t // 2
+    half_in_turn = env.half_t % 2
+
+    O_P0 = _to_int_enumish(Owner.P0)
+    O_P1 = _to_int_enumish(Owner.P1)
+
+    flat_owner = env.owner.reshape(-1).tolist()
+    flat_army = env.army.reshape(-1).tolist()
+
+    army0 = army1 = land0 = land1 = 0
+    for oo, aa in zip(flat_owner, flat_army):
+        oi = _to_int_enumish(oo)
+        if oi == O_P0:
+            land0 += 1
+            army0 += int(aa)
+        elif oi == O_P1:
+            land1 += 1
+            army1 += int(aa)
+
+    return (
+        f"half_t={env.half_t}  turn={turn}  half={half_in_turn} | "
+        f"P0 army/land={army0}/{land0}  P1 army/land={army1}/{land1}"
+    )
+
+
 def render_full_frame(
-    env_mem: GeneralsEnvWithMemory,
+    env: GeneralsEnv,
     cell: int = 20,
     draw_text: bool = True,
     pov_player: int = 0,
     hud_height: int = 14,
     draw_hud: bool = True,
 ) -> np.ndarray:
-    env = env_mem.env
     H, W = env.H, env.W
 
     O_NEU = _to_int_enumish(Owner.NEUTRAL)
@@ -195,26 +220,9 @@ def render_full_frame(
 
                     draw.text((x0 + 2, y0 + 1), str(a), fill=tc, font=font)
 
+            # keep the old top HUD code available, but you can disable via draw_hud=False
             if draw_hud and pad_top > 0:
-                turn = env.half_t // 2
-                half_in_turn = env.half_t % 2
-
-                flat_owner = env.owner.reshape(-1).tolist()
-                flat_army = env.army.reshape(-1).tolist()
-                army0 = army1 = land0 = land1 = 0
-                for oo, aa in zip(flat_owner, flat_army):
-                    oi = _to_int_enumish(oo)
-                    if oi == O_P0:
-                        land0 += 1
-                        army0 += int(aa)
-                    elif oi == O_P1:
-                        land1 += 1
-                        army1 += int(aa)
-
-                hud = (
-                    f"half_t={env.half_t}  turn={turn}  half={half_in_turn} | "
-                    f"P0 army/land={army0}/{land0}  P1 army/land={army1}/{land1}"
-                )
+                hud = _make_hud_text(env)
                 draw.rectangle((0, 0, min(W * cell, 980), pad_top), fill=(0, 0, 0))
                 draw.text((3, 0), hud, fill=(255, 255, 255), font=font)
 
@@ -360,15 +368,15 @@ def _draw_arrows_on_frame(
     cell: int,
     actions: List[int],
     probs: List[float],
-    hud_height_guess: int = 14,
+    hud_text: str = "",
+    legend: bool = True,
+    legend_w: int = 260,
 ) -> np.ndarray:
     if Image is None or ImageDraw is None:
         return frame
 
-    base = Image.fromarray(frame)
-    draw_base = ImageDraw.Draw(base)
-
-    pad_top = hud_height_guess if (frame.shape[0] >= H * cell + hud_height_guess) else 0
+    # Top HUD is disabled; everything goes to right panel
+    pad_top = 0
 
     def rank_color(i: int, n: int) -> tuple[int, int, int]:
         t = 0.0 if n <= 1 else i / (n - 1)
@@ -379,6 +387,21 @@ def _draw_arrows_on_frame(
         b = int(dark[2] * (1 - t) + light[2] * t)
         return (r, g, b)
 
+    # --- extend canvas to the right for legend/hud ---
+    if legend:
+        H0, W0 = frame.shape[0], frame.shape[1]
+        out = np.zeros((H0, W0 + legend_w, 3), dtype=np.uint8)
+        out[:, :W0, :] = frame
+        out[:, W0:, :] = (10, 10, 12)  # panel bg
+        base = Image.fromarray(out)
+        panel_x0 = W0
+    else:
+        base = Image.fromarray(frame)
+        panel_x0 = None
+
+    draw_base = ImageDraw.Draw(base)
+
+    # ---- draw arrows on the (left) map area ----
     head_len = 6
     head_w = 4
     shrink = 0.70
@@ -420,6 +443,64 @@ def _draw_arrows_on_frame(
         draw_base.line((x2s, y2s, bx, by), fill=col, width=width)
         draw_base.line((x2s, y2s, cx, cy), fill=col, width=width)
 
+    # ---- draw right panel: HUD + top-k list ----
+    if legend and panel_x0 is not None:
+        try:
+            font = ImageFont.load_default() if ImageFont is not None else None
+        except Exception:
+            font = None
+
+        x = panel_x0 + 8
+        y = 6
+
+        # HUD block
+        if hud_text:
+            draw_base.text((x, y), "HUD", fill=(235, 235, 240), font=font)
+            y += 14
+
+            # simple wrap by character count (robust, no bbox dependency)
+            line = ""
+            for ch in hud_text:
+                line += ch
+                if len(line) >= 36:
+                    draw_base.text((x, y), line, fill=(220, 220, 230), font=font)
+                    y += 14
+                    line = ""
+            if line:
+                draw_base.text((x, y), line, fill=(220, 220, 230), font=font)
+                y += 16
+
+            draw_base.line((panel_x0, y, panel_x0 + legend_w, y), fill=(35, 35, 45), width=1)
+            y += 6
+
+        # Top-k title
+        draw_base.text((x, y), f"top-{len(actions)} actions", fill=(230, 230, 235), font=font)
+        y += 14
+        draw_base.line((panel_x0, y, panel_x0 + legend_w, y), fill=(35, 35, 45), width=1)
+        y += 6
+
+        # Lines: color box + prob + (src->dst) + (optional move type)
+        for i, (a, p) in enumerate(zip(actions, probs)):
+            col = rank_color(i, len(actions))
+
+            src, d, m = _decode_action_flat(int(a))
+            r = src // W
+            c = src % W
+            dr, dc = _dir_to_delta(int(d))
+            r2 = max(0, min(H - 1, r + dr))
+            c2 = max(0, min(W - 1, c + dc))
+
+            # color box
+            draw_base.rectangle((x, y + 3, x + 10, y + 13), fill=col)
+
+            # m: 0/1 usually means half/full (depends on your env)
+            txt = f"#{i+1:02d}  p={float(p):.4f}  ({r},{c})->({r2},{c2})  m={m}"
+            draw_base.text((x + 14, y), txt, fill=(220, 220, 230), font=font)
+
+            y += 14
+            if y > base.size[1] - 16:
+                break
+
     return np.asarray(base)
 
 
@@ -450,26 +531,44 @@ def _topk_legal_actions(
 
 def make_viz_frame(
     vs: VizState,
-    env: GeneralsEnvWithMemory,
+    env: GeneralsEnv,
     policy=None,
     x_img: Optional[torch.Tensor] = None,
     x_meta: Optional[torch.Tensor] = None,
     legal_mask: Optional[torch.Tensor] = None,
 ) -> np.ndarray:
-    frame = render_full_frame(env, cell=vs.cell, draw_text=vs.draw_text, pov_player=vs.pov_player)
+    # IMPORTANT: move top HUD to right panel => disable top HUD here
+    frame = render_full_frame(
+        env,
+        cell=vs.cell,
+        draw_text=vs.draw_text,
+        pov_player=vs.pov_player,
+        hud_height=0,
+        draw_hud=False,
+    )
 
     if vs.topk_actions > 0 and policy is not None and x_img is not None and x_meta is not None and legal_mask is not None:
         try:
             top_actions, top_probs = _topk_legal_actions(policy, x_img, x_meta, legal_mask, k=int(vs.topk_actions))
+
+            if vs.print_topk:
+                # optional console print
+                for i, (a, p) in enumerate(zip(top_actions, top_probs)):
+                    src, d, m = _decode_action_flat(int(a))
+                    print(f"[viz][topk] #{i+1:02d} a={a} p={p:.6f} src={src} d={d} m={m}")
+
             if vs.draw_arrows:
+                hud_text = _make_hud_text(env)
                 frame = _draw_arrows_on_frame(
                     frame,
-                    H=env.env.H,
-                    W=env.env.W,
+                    H=env.H,
+                    W=env.W,
                     cell=vs.cell,
                     actions=top_actions,
                     probs=top_probs,
-                    hud_height_guess=14,
+                    hud_text=hud_text,
+                    legend=True,
+                    legend_w=260,
                 )
         except Exception as e:
             print(f"[viz] topk/arrow failed: {e}")
@@ -482,7 +581,7 @@ def make_viz_frame(
 # ----------------------------
 def maybe_visualize_rollout_step(
     vs: VizState,
-    env: GeneralsEnvWithMemory,
+    env: GeneralsEnv,
     upd: int,
     step: int,
     a0: int,
@@ -504,7 +603,7 @@ def maybe_visualize_rollout_step(
             "upd": int(upd),
             "step": int(step),
             "env_id": 0,
-            "half_t": int(env.env.half_t),
+            "half_t": int(env.half_t),
             "a0": int(a0),
             "a1": int(a1),
             "r": float(r),
@@ -530,7 +629,7 @@ def maybe_visualize_rollout_step(
 # ----------------------------
 def maybe_visualize_rollout_step_concat(
     vs: VizState,
-    envs: List[GeneralsEnvWithMemory],
+    envs: List[GeneralsEnv],
     upd: int,
     step: int,
     a0_list: List[int],
@@ -557,7 +656,7 @@ def maybe_visualize_rollout_step_concat(
                 "upd": int(upd),
                 "step": int(step),
                 "env_id": int(i),
-                "half_t": int(envs[i].env.half_t),
+                "half_t": int(envs[i].half_t),
                 "a0": int(a0_list[i]),
                 "a1": int(a1_list[i]),
                 "r": float(r_list[i]),
